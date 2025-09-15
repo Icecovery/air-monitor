@@ -5,7 +5,7 @@ idf_component_register(
     "led/led_controller.c"
     "tvoc/tvoc.c"
     "epaper/epaper.c"
-    "epaper/EPD_2in15b.c"
+    "epaper/EPD_2in15g.c"
     "epaper/Device_Config.c"
     "epaper/GUI_Paint.c"
     "epaper/fonts/font8.c"

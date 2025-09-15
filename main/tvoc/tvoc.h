@@ -6,19 +6,11 @@
 #define TVOC_UART UART_NUM_1
 #define TVOC_RX GPIO_NUM_4
 #define TVOC_TX GPIO_NUM_5
-#define TVOC_RST GPIO_NUM_6
-#define TVOC_ALM GPIO_NUM_7
+#define TVOC_RST GPIO_NUM_15
+#define TVOC_ALM GPIO_NUM_NC
 
 #define TVOC_UART_RX_BUFFER_SIZE 256
 #define TVOC_UART_TX_BUFFER_SIZE 0
-
-typedef struct
-{
-  uint16_t air_quality;
-  uint16_t co2;
-  uint16_t ch2o;
-  float tvoc;
-} tvoc_readings_t;
 
 /**
  * Initialize the TVOC sensor hardware interface.
@@ -45,7 +37,10 @@ void tvoc_set_device_stop_mode();
  * This function retrieves the latest data sent by the sensor in active mode.
  * It assumes that the sensor is already configured in active mode.
  */
-bool tvoc_get_active_device_data(tvoc_readings_t *readings);
+bool tvoc_get_active_device_data(uint16_t *i_air_quality,
+                                uint16_t *i_co2,
+                                uint16_t *i_ch2o,
+                                float *i_tvoc);
 
 /**
  * Check if TVOC alarm is triggered (TVOC exceeds 2ppm)

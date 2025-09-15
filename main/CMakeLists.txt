@@ -13,9 +13,5 @@ idf_component_register(
     "epaper/fonts/font16.c"
     "epaper/fonts/font20.c"
     "epaper/fonts/font24.c"
-    "scd41/scd4x_i2c.c"
-    "scd41/sensirion_common.c"
-    "scd41/sensirion_i2c_hal.c"
-    "scd41/sensirion_i2c.c"
   INCLUDE_DIRS "."
 )

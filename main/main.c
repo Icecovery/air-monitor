@@ -1,10 +1,12 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "sdkconfig.h"
 #include "driver/gpio.h"
+
 #include "led/led_controller.h"
 #include "led/led_error_handler.h"
 #include "tvoc/tvoc.h"
@@ -12,29 +14,56 @@
 #include "epaper/EPD_2in15b.h"
 #include "epaper/GUI_Paint.h"
 #include "epaper/Device_Config.h"
-#include "scd41/scd4x_i2c.h"
-#include "scd41/sensirion_common.h"
-#include "scd41/sensirion_i2c_hal.h"
+#include <scd4x.h>
 
 static const char *TAG = "main";
 
+// Mutexes for shared data
+#define MUTEX_TIMEOUT_TICKS pdMS_TO_TICKS(100)
+static SemaphoreHandle_t tvoc_data_mutex = NULL;
+static SemaphoreHandle_t co2_data_mutex = NULL;
+
+// Data readings
+static uint16_t g_aqi_reading = 0;
+static uint16_t g_eco2_reading = 0;
+static uint16_t g_ch2o_reading = 0;
+static float g_tvoc_reading = 0.0f;
+
+static float g_temperature_reading = 0.0f;
+static float g_humidity_reading = 0.0f;
+static uint16_t g_co2_reading = 0;
+
 static void tvoc_task(void *pvParameters)
 {
+  static const char *TASK_TAG = "tvoc_task";
   tvoc_init();
   tvoc_set_device_active_mode();
 
-  static tvoc_readings_t readings;
-  static tvoc_readings_t prev_readings = {0};
+  static uint16_t aqi = 0;
+  static uint16_t eco2 = 0;
+  static uint16_t ch2o = 0;
+  static float tvoc = 0.0f;
 
-  while (1)
+  while (true)
   {
-    if (tvoc_get_active_device_data(&readings))
+    if (tvoc_get_active_device_data(&aqi, &eco2, &ch2o, &tvoc))
     {
-      if (memcmp(&readings, &prev_readings, sizeof(tvoc_readings_t)) != 0)
+      if (aqi != g_aqi_reading || eco2 != g_eco2_reading || ch2o != g_ch2o_reading || tvoc != g_tvoc_reading)
       {
-        ESP_LOGI(TAG, "TVOC sensor data - Air Quality: %d, CO2: %d ppm, CH2O: %d ppb, TVOC: %.3f ppm",
-                 readings.air_quality, readings.co2, readings.ch2o, readings.tvoc);
-        prev_readings = readings;
+        ESP_LOGI(TASK_TAG, "TVOC sensor data - AQI: %d, eCO2: %d ppm, CH2O: %d ppb, TVOC: %.3f ppm",
+                 aqi, eco2, ch2o, tvoc);
+        if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+        {
+          g_aqi_reading = aqi;
+          g_eco2_reading = eco2;
+          g_ch2o_reading = ch2o;
+          g_tvoc_reading = tvoc;
+          xSemaphoreGive(tvoc_data_mutex);
+        }
+        else
+        {
+          ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex");
+        }
       }
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -44,20 +73,27 @@ static void tvoc_task(void *pvParameters)
 static void scd41_task(void *pvParameters)
 {
   const char *TASK_TAG = "scd41_task";
-  int16_t error = NO_ERROR;
+  int16_t error = ESP_OK;
 
-  // init I2C
-  sensirion_i2c_hal_init();
+  // Initialize I2C
+  ESP_ERROR_CHECK(i2cdev_init());
 
-  // Initialize SCD41 sensor
-  scd4x_init(SCD41_I2C_ADDR_62);
+  // Initialize SCD41 sensor descriptor
+  i2c_dev_t dev = {0};
+  ESP_ERROR_CHECK(scd4x_init_desc(&dev, 0, GPIO_NUM_6, GPIO_NUM_7));
+
+  ESP_LOGI(TASK_TAG, "Initializing SCD41 sensor...");
 
   // Ensure sensor is in clean state
   vTaskDelay(pdMS_TO_TICKS(30));
-  error = scd4x_wake_up();
-  if (error != NO_ERROR)
+  error = scd4x_wake_up(&dev);
+  if (error != ESP_OK)
   {
-    ESP_LOGE(TASK_TAG, "Error waking up sensor: %i, sensor might be taking periodic measurements", error);
+    ESP_LOGE(
+        TASK_TAG,
+        "Error waking up sensor: %i (%s), sensor might be taking periodic measurements",
+        error,
+        esp_err_to_name(error));
   }
   else
   {
@@ -65,83 +101,164 @@ static void scd41_task(void *pvParameters)
   }
 
   // Stop periodic measurement if any
-  error = scd4x_stop_periodic_measurement();
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error stopping periodic measurement: %i", error);
+  error = scd4x_stop_periodic_measurement(&dev);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error stopping periodic measurement", error);
   ESP_LOGI(TASK_TAG, "Stopped periodic measurement");
 
   // Reinitialize sensor
-  error = scd4x_reinit();
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error reinitializing sensor: %i", error);
+  error = scd4x_reinit(&dev);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error reinitializing sensor", error);
   ESP_LOGI(TASK_TAG, "Reinitialized sensor");
 
   // Read out information about the sensor
-  uint16_t serial_number[3] = {0};
-  error = scd4x_get_serial_number(serial_number, 3);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting serial number: %i", error);
-  uint64_t serial_as_int = 0;
-  sensirion_common_to_integer((uint8_t *)serial_number, (uint8_t *)&serial_as_int, LONG_INTEGER, 6);
-  ESP_LOGI(TASK_TAG, "Serial number: 0x%" PRIx64, serial_as_int);
+  uint16_t serial[3];
+  error = scd4x_get_serial_number(&dev, serial, serial + 1, serial + 2);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting serial number", error);
+  ESP_LOGI(TASK_TAG, "Sensor serial number: 0x%04x%04x%04x", serial[0], serial[1], serial[2]);
 
   // Self test
-  uint16_t sensor_status = 0;
-  error = scd4x_perform_self_test(&sensor_status);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error performing self test: %i", error);
-  ESP_LOGI(TASK_TAG, "Self-test status: %u", sensor_status);
+  bool malfunction = false;
+  error = scd4x_perform_self_test(&dev, &malfunction);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error performing self test", error);
+  ESP_LOGI(TASK_TAG, "Self-test status: %s", malfunction ? "MALFUNCTION" : "OK");
 
   // Start periodic measurements (5sec interval)
-  error = scd4x_start_periodic_measurement();
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error starting periodic measurement: %i", error);
+  error = scd4x_start_periodic_measurement(&dev);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error starting periodic measurement", error);
   ESP_LOGI(TASK_TAG, "Ready to start measurements");
 
   // Read measurements loop
-  bool data_ready = false;
-  uint16_t co2_concentration = 0;
-  int32_t temperature = 0;
-  int32_t relative_humidity = 0;
-  while (1)
+  static bool data_ready = false;
+  static uint16_t co2;
+  static float temperature, humidity;
+  while (true)
   {
     // we sample once every 5 seconds
     vTaskDelay(pdMS_TO_TICKS(5000));
 
     // check if data is ready
-    error = scd4x_get_data_ready_status(&data_ready);
-    if (error != NO_ERROR)
+    error = scd4x_get_data_ready_status(&dev, &data_ready);
+    if (error != ESP_OK)
     {
-      ESP_LOGE(TASK_TAG, "Error getting data ready status: %i", error);
+      ESP_LOGE(
+          TASK_TAG,
+          "Error getting data ready status: %i (%s)",
+          error,
+          esp_err_to_name(error));
       continue;
     }
 
     // if not, wait until it is
     while (!data_ready)
     {
+      // turn on blue LED to indicate waiting for data
+      led_controller_set_solid((led_color_t)LED_COLOR_BLUE);
       vTaskDelay(pdMS_TO_TICKS(100));
-      error = scd4x_get_data_ready_status(&data_ready);
-      if (error != NO_ERROR)
+      led_controller_set_off();
+      error = scd4x_get_data_ready_status(&dev, &data_ready);
+      if (error != ESP_OK)
       {
-        ESP_LOGE(TASK_TAG, "Error getting data ready status: %i", error);
+        ESP_LOGE(TASK_TAG,
+                 "Error getting data ready status: %i (%s)",
+                 error,
+                 esp_err_to_name(error));
         continue;
       }
     }
 
     // read the sensor data
-    error = scd4x_read_measurement(&co2_concentration, &temperature, &relative_humidity);
-    if (error != NO_ERROR)
+    error = scd4x_read_measurement(&dev, &co2, &temperature, &humidity);
+    if (error != ESP_OK)
     {
-      ESP_LOGE(TASK_TAG, "Error reading measurement: %i", error);
+      ESP_LOGE(TASK_TAG,
+               "Error reading measurement: %i (%s)",
+               error,
+               esp_err_to_name(error));
       continue;
     }
 
-    // print results in physical units.
-    ESP_LOGI(TASK_TAG, "CO2 concentration [ppm]: %u", co2_concentration);
-    ESP_LOGI(TASK_TAG, "Temperature [m°C] : %i", temperature);
-    ESP_LOGI(TASK_TAG, "Humidity [mRH]: %i", relative_humidity);
+    if (co2 != g_co2_reading || temperature != g_temperature_reading || humidity != g_humidity_reading)
+    {
+      // print results in physical units.
+      ESP_LOGI(TASK_TAG, "SCD41 sensor data - CO2: %d ppm, Temperature: %.2f °C, Humidity: %.2f %%", co2, temperature, humidity);
+      if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+      {
+        g_co2_reading = co2;
+        g_temperature_reading = temperature;
+        g_humidity_reading = humidity;
+        xSemaphoreGive(co2_data_mutex);
+      }
+      else
+      {
+        ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex");
+      }
+    }
+  }
+}
+
+static void periodic_update_task(void *pvParameters)
+{
+  const char *TASK_TAG = "update_task";
+
+  while (true)
+  {
+    // Update display every minute
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    ESP_ERROR_CHECK(led_controller_set_solid((led_color_t)LED_COLOR_GREEN));
+
+    // Take mutexes to read shared data
+    uint16_t aqi = 0, eco2 = 0, co2 = 0, ch2o = 0;
+    float tvoc = 0.0f, temperature = 0.0f, humidity = 0.0f;
+
+    if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+    {
+      aqi = g_aqi_reading;
+      ch2o = g_ch2o_reading;
+      tvoc = g_tvoc_reading;
+      eco2 = g_eco2_reading;
+      xSemaphoreGive(tvoc_data_mutex);
+    }
+    else
+    {
+      ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex for display update");
+    }
+
+    if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+    {
+      co2 = g_co2_reading;
+      temperature = g_temperature_reading;
+      humidity = g_humidity_reading;
+      xSemaphoreGive(co2_data_mutex);
+    }
+    else
+    {
+      ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for display update");
+    }
+
+    // Log to console for now
+    ESP_LOGI(TASK_TAG,
+             "=== Readings ===\n"
+             "AQI: \t%d\n"
+             "eCO2:\t%d\tppm\n"
+             "CH2O:\t%d\tppb\n"
+             "tVOC:\t%.3f\tppm\n"
+             "CO2: \t%d\tppm\n"
+             "Temp:\t%.3f\t°C\n"
+             "RH:  \t%.3f\t%%",
+             aqi,
+             eco2,
+             ch2o,
+             tvoc,
+             co2,
+             temperature,
+             humidity);
+
+    ESP_ERROR_CHECK(led_controller_set_off());
   }
 }
 
 void app_main(void)
 {
-  vTaskDelay(pdMS_TO_TICKS(5000));
-
   ESP_LOGI(TAG, "Air Monitor starting...");
 
   // Initialize the LED controller first
@@ -152,9 +269,23 @@ void app_main(void)
     return;
   }
 
-  // xTaskCreate(tvoc_task, "tvoc_task", 4096, NULL, 5, NULL);
-  // epaper_setup();
+  // flash the LED in green to indicate startup and wait for serial console to be ready
+  ESP_ERROR_CHECK(led_controller_set_blink((led_color_t)LED_COLOR_GREEN, 500, 10));
+  vTaskDelay(pdMS_TO_TICKS(900));
+  ESP_ERROR_CHECK(led_controller_set_off());
+  vTaskDelay(pdMS_TO_TICKS(4100));
+
+  ESP_LOGI(TAG, "Creating tasks...");
+
+  // Create mutexes for shared data
+  tvoc_data_mutex = xSemaphoreCreateMutex();
+  HALT_IF_NULL_WITH_LED(TAG, tvoc_data_mutex, "Failed to create TVOC data mutex");
+  co2_data_mutex = xSemaphoreCreateMutex();
+  HALT_IF_NULL_WITH_LED(TAG, co2_data_mutex, "Failed to create CO2 data mutex");
+
+  xTaskCreate(tvoc_task, "tvoc_task", 4096, NULL, 5, NULL);
   xTaskCreate(scd41_task, "scd41_task", 4096, NULL, 5, NULL);
+  xTaskCreate(periodic_update_task, "update_task", 8192, NULL, 5, NULL);
 
   ESP_LOGI(TAG, "All tasks created successfully");
 }

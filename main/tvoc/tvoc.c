@@ -20,8 +20,8 @@ uint8_t GET_QUERY_BUF[9] = {0xFE, 0x00, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86
 uint8_t rx_buf[11]; // Serial port receiving array (for storing incoming data)
 
 _lock_t data_lock;
-uint8_t air_quality = 0;  // Variable to store air quality index
-uint16_t co2 = 0;         // CO2 ppm
+uint8_t aqi = 0;          // air quality index
+uint16_t eco2 = 0;        // eCO2 ppm
 uint16_t ch2o = 0;        // formaldehyde (CH2O) ppb
 float tvoc = 0;           // TVOC (Total Volatile Organic Compounds) ppm
 
@@ -57,11 +57,14 @@ void tvoc_init()
   gpio_set_level(TVOC_RST, 1);
 
   // Configure alarm pin as input with pull-up
-  io_conf.mode = GPIO_MODE_INPUT;
-  io_conf.pin_bit_mask = (1ULL << TVOC_ALM);
-  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-  ESP_ERROR_CHECK(gpio_config(&io_conf));
+  if (TVOC_ALM != GPIO_NUM_NC) // Only configure if ALM pin is defined
+  {
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pin_bit_mask = (1ULL << TVOC_ALM);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+  }
 
   ESP_LOGI(TAG, "TVOC UART initialized");
 }
@@ -113,7 +116,10 @@ void tvoc_set_device_stop_mode()
   ESP_LOGI(TAG, "TVOC sensor set to stop mode");
 }
 
-bool tvoc_get_active_device_data(tvoc_readings_t *readings)
+bool tvoc_get_active_device_data(uint16_t *i_air_quality,
+                                uint16_t *i_eco2,
+                                uint16_t *i_ch2o,
+                                float *i_tvoc)
 {
   size_t buffer_length = 0;
   ESP_ERROR_CHECK(uart_get_buffered_data_len(TVOC_UART, &buffer_length));
@@ -151,20 +157,20 @@ bool tvoc_get_active_device_data(tvoc_readings_t *readings)
   }
 
   // extract TVOC, CO2, and CH2O values
-  air_quality = rx_buf[1];                        // Air quality index
-  co2 = (rx_buf[3] << 8) | rx_buf[4];             // Combine two bytes to get CO2 value
+  aqi = rx_buf[1];                        // Air quality index
+  eco2 = (rx_buf[3] << 8) | rx_buf[4];             // Combine two bytes to get eCO2 value
   ch2o = (rx_buf[5] << 8) | rx_buf[6];            // Combine two bytes to get formaldehyde (CH2O) value
   tvoc = ((rx_buf[7] << 8) | rx_buf[8]) / 1000.0; // Combine two bytes and convert to TVOC value
 
-  readings->air_quality = air_quality;
-  readings->co2 = co2;
-  readings->ch2o = ch2o;
-  readings->tvoc = tvoc;
+  *i_air_quality = aqi;
+  *i_eco2 = eco2;
+  *i_ch2o = ch2o;
+  *i_tvoc = tvoc;
 
   return true;
 }
 
 bool tvoc_is_alarm_triggered(void)
 {
-  return (gpio_get_level(TVOC_ALM) == 0);
+  return (TVOC_ALM != GPIO_NUM_NC && gpio_get_level(TVOC_ALM) == 0);
 }

@@ -61,11 +61,21 @@ typedef struct _tFont
 
 } sFONT;
 
+typedef struct _tLutFont
+{
+  const uint8_t *table;
+  const uint16_t *lut;
+  uint16_t Width;
+  uint16_t Height;
+} lFont;
+
 extern sFONT Font24;
 extern sFONT Font20;
 extern sFONT Font16;
 extern sFONT Font12;
 extern sFONT Font8;
+extern lFont RecMono40Numbers;
+extern lFont RecMono36;
 
 #ifdef __cplusplus
 }

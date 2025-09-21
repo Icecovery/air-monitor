@@ -13,5 +13,7 @@ idf_component_register(
     "epaper/fonts/font16.c"
     "epaper/fonts/font20.c"
     "epaper/fonts/font24.c"
+    "epaper/fonts/rec_mono_40.c"
+    "epaper/fonts/rec_mono_36.c"
   INCLUDE_DIRS "."
 )

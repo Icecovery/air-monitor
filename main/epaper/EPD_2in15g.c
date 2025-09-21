@@ -74,31 +74,15 @@ static void EPD_2IN15G_SendData(UBYTE data)
 function :	Wait until the busy_pin goes LOW
 parameter:
 ******************************************************************************/
-void EPD_2IN15G_ReadBusy(void)
-{
-  DEV_LOG("e-Paper busy");
-  DEV_Delay_ms(100);
-
-  // SET: busy, RESET: idle
-  while(DEV_Digital_Read(EPD_BUSY_PIN) == GPIO_PIN_SET) {
-    DEV_Delay_ms(100);
-  }
-  DEV_LOG("e-Paper busy release\r\n");
-}
-
-/******************************************************************************
-function :	Wait until the busy_pin goes LOW
-parameter:
-******************************************************************************/
 static void EPD_2IN15G_ReadBusyH(void)
 {
-  DEV_LOG("e-Paper busy H");
+  DEV_LOG("busy");
   
   // SET: busy, RESET: idle
   while(!DEV_Digital_Read(EPD_BUSY_PIN)) {
-    DEV_Delay_ms(5);
+    DEV_Delay_ms(1000);
   }
-  DEV_LOG("e-Paper busy H release");
+  DEV_LOG("busy release");
 }
 
 /******************************************************************************
@@ -197,6 +181,8 @@ void EPD_2IN15G_Init(void)
   EPD_2IN15G_SendData(0x01);
 
   EPD_2IN15G_SendCommand(0x04);
+
+  DEV_LOG("init commands sent");
   EPD_2IN15G_ReadBusyH();
 }
 

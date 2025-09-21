@@ -213,6 +213,9 @@ void Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString, sFONT
 void Paint_DrawNum(UWORD Xpoint, UWORD Ypoint, int32_t Nummber, sFONT* Font, UWORD Color_Foreground, UWORD Color_Background);
 void Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font, UWORD Color_Foreground, UWORD Color_Background);
 
+// Custom LUT font string
+void Paint_DrawString_LUT(UWORD Xstart, UWORD Ystart, const char * pString, lFont* Font, UWORD Color_Foreground, UWORD Color_Background);
+
 //pic
 void Paint_DrawBitMap(const unsigned char* image_buffer);
 void Paint_DrawBitMap_Paste(const unsigned char* image_buffer, UWORD xStart, UWORD yStart, UWORD imageWidth, UWORD imageHeight, UBYTE flipColor);

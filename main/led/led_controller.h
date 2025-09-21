@@ -40,6 +40,7 @@ typedef struct {
 #define LED_COLOR_CYAN      {.r = 0,   .g = 255, .b = 255}
 #define LED_COLOR_MAGENTA   {.r = 255, .g = 0,   .b = 255}
 #define LED_COLOR_ORANGE    {.r = 255, .g = 165, .b = 0}
+#define LED_COLOR_DIM_BLUE  {.r = 0,   .g = 0,   .b = 32}
 #define LED_COLOR_OFF       {.r = 0,   .g = 0,   .b = 0}
 
 // Default configurations

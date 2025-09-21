@@ -6,12 +6,13 @@
 #include "esp_check.h"
 #include "sdkconfig.h"
 #include "driver/gpio.h"
+#include "math.h"
 
 #include "led/led_controller.h"
 #include "led/led_error_handler.h"
 #include "tvoc/tvoc.h"
 #include "epaper/epaper.h"
-#include "epaper/EPD_2in15b.h"
+#include "epaper/EPD_2in15g.h"
 #include "epaper/GUI_Paint.h"
 #include "epaper/Device_Config.h"
 #include <scd4x.h>
@@ -32,6 +33,9 @@ static float g_tvoc_reading = 0.0f;
 static float g_temperature_reading = 0.0f;
 static float g_humidity_reading = 0.0f;
 static uint16_t g_co2_reading = 0;
+
+#define SCD41_TEMP_OFFSET 10.8f
+#define SCD41_ALTITUDE 70
 
 static void tvoc_task(void *pvParameters)
 {
@@ -122,6 +126,63 @@ static void scd41_task(void *pvParameters)
   HALT_IF_ERR_WITH_LED(TASK_TAG, "Error performing self test", error);
   ESP_LOGI(TASK_TAG, "Self-test status: %s", malfunction ? "MALFUNCTION" : "OK");
 
+  bool persisted_settings_dirty = false;
+
+  // set temperature offset
+  float temp_offset = 0.0f;
+  error = scd4x_get_temperature_offset(&dev, &temp_offset);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting temperature offset", error);
+  ESP_LOGI(TASK_TAG, "Current temperature offset: %.2f °C", temp_offset);
+
+  if (fabsf(temp_offset - SCD41_TEMP_OFFSET) > 0.01f)
+  {
+    ESP_LOGW(TASK_TAG, "Current temperature offset %.2f °C is not the expected value of %.2f °C", temp_offset, SCD41_TEMP_OFFSET);
+
+    // temperature offset
+    error = scd4x_set_temperature_offset(&dev, SCD41_TEMP_OFFSET);
+    HALT_IF_ERR_WITH_LED(TASK_TAG, "Error setting temperature offset", error);
+    ESP_LOGI(TASK_TAG, "Set temperature offset to %.2f °C", SCD41_TEMP_OFFSET);
+
+    // persist the temperature offset
+    persisted_settings_dirty = true;
+  } else {
+    ESP_LOGI(TASK_TAG, "Good temperature offset");
+  }
+
+  // set altitude compensation
+  uint16_t altitude = 0;
+  error = scd4x_get_sensor_altitude(&dev, &altitude);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting sensor altitude", error);
+  ESP_LOGI(TASK_TAG, "Sensor altitude: %d m", altitude);
+
+  if (altitude != SCD41_ALTITUDE)
+  {
+    ESP_LOGW(TASK_TAG, "Current sensor altitude %d m is not the expected value of %d m", altitude, SCD41_ALTITUDE);
+
+    error = scd4x_set_sensor_altitude(&dev, SCD41_ALTITUDE);
+    HALT_IF_ERR_WITH_LED(TASK_TAG, "Error setting sensor altitude", error);
+    ESP_LOGI(TASK_TAG, "Set sensor altitude to %d m", SCD41_ALTITUDE);
+
+    // persist the altitude
+    persisted_settings_dirty = true;
+  } else {
+    ESP_LOGI(TASK_TAG, "Good sensor altitude");
+  }
+
+  // persist settings if needed
+  if (persisted_settings_dirty)
+  {
+    error = scd4x_persist_settings(&dev);
+    HALT_IF_ERR_WITH_LED(TASK_TAG, "Error persisting settings", error);
+    ESP_LOGI(TASK_TAG, "Persisted settings to non-volatile memory");
+  }
+
+  // check if automatic self-calibration is enabled
+  bool asc_enabled = false;
+  error = scd4x_get_automatic_self_calibration(&dev, &asc_enabled);
+  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting automatic self-calibration status", error);
+  ESP_LOGI(TASK_TAG, "Automatic self-calibration is %s", asc_enabled ? "ENABLED" : "DISABLED");
+
   // Start periodic measurements (5sec interval)
   error = scd4x_start_periodic_measurement(&dev);
   HALT_IF_ERR_WITH_LED(TASK_TAG, "Error starting periodic measurement", error);
@@ -200,11 +261,12 @@ static void periodic_update_task(void *pvParameters)
 {
   const char *TASK_TAG = "update_task";
 
+  epaper_setup();
+
   while (true)
   {
-    // Update display every minute
-    vTaskDelay(pdMS_TO_TICKS(10000));
-    ESP_ERROR_CHECK(led_controller_set_solid((led_color_t)LED_COLOR_GREEN));
+    // Update display every 5 minutes
+    vTaskDelay(pdMS_TO_TICKS(300000));
 
     // Take mutexes to read shared data
     uint16_t aqi = 0, eco2 = 0, co2 = 0, ch2o = 0;
@@ -253,6 +315,8 @@ static void periodic_update_task(void *pvParameters)
              temperature,
              humidity);
 
+    ESP_ERROR_CHECK(led_controller_set_solid((led_color_t)LED_COLOR_DIM_BLUE));
+    epaper_display(aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
     ESP_ERROR_CHECK(led_controller_set_off());
   }
 }
@@ -285,7 +349,7 @@ void app_main(void)
 
   xTaskCreate(tvoc_task, "tvoc_task", 4096, NULL, 5, NULL);
   xTaskCreate(scd41_task, "scd41_task", 4096, NULL, 5, NULL);
-  xTaskCreate(periodic_update_task, "update_task", 8192, NULL, 5, NULL);
+  xTaskCreate(periodic_update_task, "update_task", 16384, NULL, 5, NULL);
 
   ESP_LOGI(TAG, "All tasks created successfully");
 }

@@ -44,7 +44,7 @@
 /**
  * Debug
 **/
-#define DEV_LOG(...) ESP_LOGI("epaper", __VA_ARGS__)
+#define DEV_LOG(...) ESP_LOGI("epaper_device", __VA_ARGS__)
 
 /*------------------------------------------------------------------------------------------------------*/
 void DEV_Module_Init(void);

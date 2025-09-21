@@ -188,7 +188,7 @@ parameter:
 void Paint_SetPixel(UWORD Xpoint, UWORD Ypoint, UWORD Color)
 {
   if(Xpoint > Paint.Width || Ypoint > Paint.Height){
-    DEV_LOG("Exceeding display boundaries");
+    // DEV_LOG("Exceeding display boundaries");
     return;
   }
   UWORD X, Y;
@@ -231,7 +231,7 @@ void Paint_SetPixel(UWORD Xpoint, UWORD Ypoint, UWORD Color)
   }
 
   if(X > Paint.WidthMemory || Y > Paint.HeightMemory){
-    DEV_LOG("Exceeding display boundaries");
+    // DEV_LOG("Exceeding display boundaries");
     return;
   }
 
@@ -587,7 +587,7 @@ void Paint_DrawString_EN(UWORD Xstart, UWORD Ystart, const char * pString,
       Xpoint = Xstart;
       Ypoint = Ystart;
     }
-    Paint_DrawChar(Xpoint, Ypoint, * pString, Font, Color_Background, Color_Foreground);
+    Paint_DrawChar(Xpoint, Ypoint, *pString, Font, Color_Foreground, Color_Background);
 
     //The next character of the address
     pString ++;
@@ -665,6 +665,74 @@ void Paint_DrawTime(UWORD Xstart, UWORD Ystart, PAINT_TIME *pTime, sFONT* Font,
   Paint_DrawChar(Xstart + Dx * 4 + Dx / 2 - Dx / 4, Ystart, ':'                    , Font, Color_Background, Color_Foreground);
   Paint_DrawChar(Xstart + Dx * 5                  , Ystart, value[pTime->Sec / 10] , Font, Color_Background, Color_Foreground);
   Paint_DrawChar(Xstart + Dx * 6                  , Ystart, value[pTime->Sec % 10] , Font, Color_Background, Color_Foreground);
+}
+
+void Paint_DrawString_LUT(UWORD Xstart, UWORD Ystart, const char * pString, lFont* Font, UWORD Color_Foreground, UWORD Color_Background)
+{
+  UWORD Xpoint = Xstart;
+  UWORD Ypoint = Ystart;
+
+  if (Xstart > Paint.Width || Ystart > Paint.Height) {
+    DEV_LOG("Paint_DrawString_EN Input exceeds the normal display range");
+    return;
+  }
+
+  while (* pString != '\0') {
+    // //if X direction filled , reposition to(Xstart,Ypoint),Ypoint is Y direction plus the Height of the character
+    // if ((Xpoint + Font->Width ) > Paint.Width ) {
+    //   Xpoint = Xstart;
+    //   Ypoint += Font->Height;
+    // }
+
+    // // If the Y direction is full, reposition to(Xstart, Ystart)
+    // if ((Ypoint + Font->Height ) > Paint.Height ) {
+    //   Xpoint = Xstart;
+    //   Ypoint = Ystart;
+    // }
+
+    //
+    // Pseudocode for retrieving data for a specific character:
+    //
+    // offset = ascii_code(character) - ascii_code(' ')
+    // data = table[lut[offset]]
+    //
+
+    uint32_t Char_Offset = ( (*pString) - ' ' );
+    uint16_t start_of_char_data_ptr = Font->lut[Char_Offset];
+    // now, draw the character pixel by pixel, we already have the starting pointer and the width/height
+    const unsigned char *pData = &Font->table[start_of_char_data_ptr];
+    UWORD Page, Column;
+    for (Page = 0; Page < Font->Height; Page ++ ) {
+      for (Column = 0; Column < Font->Width; Column ++ ) {
+
+        //To determine whether the font background color and screen background color is consistent
+        if (FONT_BACKGROUND == Color_Background) { //this process is to speed up the scan
+          if (*pData & (0x80 >> (Column % 8)))
+            Paint_SetPixel(Xpoint + Column, Ypoint + Page, Color_Foreground);
+            // Paint_DrawPoint(Xpoint + Column, Ypoint + Page, Color_Foreground, DOT_PIXEL_DFT, DOT_STYLE_DFT);
+        } else {
+          if (*pData & (0x80 >> (Column % 8))) {
+            Paint_SetPixel(Xpoint + Column, Ypoint + Page, Color_Foreground);
+            // Paint_DrawPoint(Xpoint + Column, Ypoint + Page, Color_Foreground, DOT_PIXEL_DFT, DOT_STYLE_DFT);
+          } else {
+            Paint_SetPixel(Xpoint + Column, Ypoint + Page, Color_Background);
+            // Paint_DrawPoint(Xpoint + Column, Ypoint + Page, Color_Background, DOT_PIXEL_DFT, DOT_STYLE_DFT);
+          }
+        }
+        //One pixel is 8 bits
+        if (Column % 8 == 7)
+          pData++;
+      }// Write a line
+      if (Font->Width % 8 != 0)
+        pData++;
+    }// Write all of the character
+
+    //The next character of the address
+    pString ++;
+
+    //The next word of the abscissa increases the font of the broadband
+    Xpoint += Font->Width;
+  }
 }
 
 /******************************************************************************

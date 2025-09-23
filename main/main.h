@@ -8,6 +8,7 @@
 
 #define MUTEX_TIMEOUT_TICKS pdMS_TO_TICKS(100) // 100 milliseconds
 #define DISPLAY_UPDATE_INTERVAL_TICKS pdMS_TO_TICKS(600000) // 10 minutes
+#define ZIGBEE_UPDATE_INTERVAL_TICKS pdMS_TO_TICKS(15000) // 15 seconds
 
 #define FLOAT_NEQ(a, b) (fabsf((a) - (b)) > 0.01f)
 

@@ -10,6 +10,19 @@
 
 static const char *TAG = "zigbee";
 
+/* Static function declarations */
+static void zigbee_task(void *pvParameters);
+static esp_err_t zigbee_action_handler(esp_zb_core_action_callback_id_t callback_id, const void *message);
+static esp_err_t zigbee_set_attribute_handler(const esp_zb_zcl_set_attr_value_message_t *message);
+static esp_err_t zigbee_identify_handler(const esp_zb_zcl_identify_effect_message_t *message);
+static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask);
+static esp_zb_ep_list_t *endpoints_create(void);
+static esp_zb_cluster_list_t *basic_clusters_create(void);
+static esp_zb_cluster_list_t *eco2_clusters_create(void);
+static esp_zb_cluster_list_t *tvoc_clusters_create(void);
+static esp_zb_cluster_list_t *formaldehyde_clusters_create(void);
+static esp_zb_cluster_list_t *aqi_clusters_create(void);
+
 /* Global variables to store current sensor values */
 static uint16_t current_aqi = 0;
 static uint16_t current_eco2 = 0;
@@ -32,7 +45,7 @@ void zigbee_init(void)
 
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_ERROR_CHECK(esp_zb_platform_config(&config));
-  xTaskCreate(zigbee_task, "zigbee_task", 16384, NULL, 5, NULL);
+  xTaskCreate(zigbee_task, "zigbee_task", 4096, NULL, 4, NULL);
   ESP_LOGI(TAG, "Zigbee initialized");
 }
 
@@ -42,12 +55,8 @@ static void zigbee_task(void *pvParameters)
   esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_CONFIG();
   esp_zb_init(&zb_nwk_cfg);
 
-  /* set custom ieee address */
-  uint8_t* address = (uint8_t[]){0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x12, 0x34}; // in little-endian
-  ESP_ERROR_CHECK(esp_zb_set_long_address(address));
-
-  /* Create air monitor endpoint */
-  esp_zb_ep_list_t *esp_zb_air_monitor_ep = air_monitor_ep_create();
+  /* Create air monitor endpoints */
+  esp_zb_ep_list_t *esp_zb_air_monitor_ep = endpoints_create();
   
   /* Add manufacturer information */
   zcl_basic_manufacturer_info_t info = MANUFACTURER_INFO();
@@ -120,12 +129,12 @@ static esp_err_t zigbee_identify_handler(const esp_zb_zcl_identify_effect_messag
   return ret;
 }
 
-static esp_zb_ep_list_t *air_monitor_ep_create(void)
+static esp_zb_ep_list_t *endpoints_create(void)
 {
   esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
 
   /* Main basic endpoint */
-  esp_zb_cluster_list_t *cluster_list = air_monitor_clusters_create();
+  esp_zb_cluster_list_t *cluster_list = basic_clusters_create();
   esp_zb_endpoint_config_t endpoint_config = {
     .endpoint = BASIC_ENDPOINT,
     .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
@@ -144,10 +153,40 @@ static esp_zb_ep_list_t *air_monitor_ep_create(void)
   };
   esp_zb_ep_list_add_ep(ep_list, eco2_cluster_list, eco2_endpoint_config);
 
+  /* TVOC endpoint */
+  esp_zb_cluster_list_t *tvoc_cluster_list = tvoc_clusters_create();
+  esp_zb_endpoint_config_t tvoc_endpoint_config = {
+    .endpoint = TVOC_ENDPOINT,
+    .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+    .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+    .app_device_version = 0
+  };
+  esp_zb_ep_list_add_ep(ep_list, tvoc_cluster_list, tvoc_endpoint_config);
+
+  /* Formaldehyde endpoint */
+  esp_zb_cluster_list_t *formaldehyde_cluster_list = formaldehyde_clusters_create();
+  esp_zb_endpoint_config_t formaldehyde_endpoint_config = {
+    .endpoint = FORMALDEHYDE_ENDPOINT,
+    .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+    .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+    .app_device_version = 0
+  };
+  esp_zb_ep_list_add_ep(ep_list, formaldehyde_cluster_list, formaldehyde_endpoint_config);
+
+  /* AQI endpoint */
+  esp_zb_cluster_list_t *aqi_cluster_list = aqi_clusters_create();
+  esp_zb_endpoint_config_t aqi_endpoint_config = {
+    .endpoint = AQI_ENDPOINT,
+    .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+    .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+    .app_device_version = 0
+  };
+  esp_zb_ep_list_add_ep(ep_list, aqi_cluster_list, aqi_endpoint_config);
+
   return ep_list;
 }
 
-static esp_zb_cluster_list_t* air_monitor_clusters_create(void)
+static esp_zb_cluster_list_t* basic_clusters_create(void)
 {
   esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
   
@@ -193,45 +232,6 @@ static esp_zb_cluster_list_t* air_monitor_clusters_create(void)
   esp_zb_attribute_list_t *esp_zb_co2_cluster = esp_zb_carbon_dioxide_measurement_cluster_create(&co2_meas_cfg);
   ESP_ERROR_CHECK(esp_zb_cluster_list_add_carbon_dioxide_measurement_cluster(cluster_list, esp_zb_co2_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-  /* TVOC measurement cluster */
-  esp_zb_attribute_list_t *esp_zb_tvoc_cluster = esp_zb_zcl_attr_list_create(CLUSTER_ID_TVOC_MEASUREMENT);
-  esp_zb_cluster_add_manufacturer_attr(
-    esp_zb_tvoc_cluster, 
-    CLUSTER_ID_TVOC_MEASUREMENT, 
-    ATTR_GENERIC_MEASURED_VALUE_CODE, 
-    ATTR_MANUFACTURER_CODE, 
-    ESP_ZB_ZCL_ATTR_TYPE_U16, 
-    ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, 
-    &current_tvoc
-  );
-  ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(cluster_list, esp_zb_tvoc_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-
-  /* Formaldehyde measurement cluster */
-  esp_zb_attribute_list_t *esp_zb_ch2o_cluster = esp_zb_zcl_attr_list_create(CLUSTER_ID_FORMALDEHYDE_MEASUREMENT);
-  esp_zb_cluster_add_manufacturer_attr(
-    esp_zb_ch2o_cluster, 
-    CLUSTER_ID_FORMALDEHYDE_MEASUREMENT, 
-    ATTR_GENERIC_MEASURED_VALUE_CODE,
-    ATTR_MANUFACTURER_CODE, 
-    ESP_ZB_ZCL_ATTR_TYPE_U16,
-    ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, 
-    &current_ch2o
-  );
-  ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(cluster_list, esp_zb_ch2o_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-
-  /* AQI measurement cluster */
-  esp_zb_attribute_list_t *esp_zb_aqi_cluster = esp_zb_zcl_attr_list_create(CLUSTER_ID_AQI_MEASUREMENT);
-  esp_zb_cluster_add_manufacturer_attr(
-    esp_zb_aqi_cluster,
-    CLUSTER_ID_AQI_MEASUREMENT,
-    ATTR_GENERIC_MEASURED_VALUE_CODE,
-    ATTR_MANUFACTURER_CODE,
-    ESP_ZB_ZCL_ATTR_TYPE_U16,
-    ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY,
-    &current_aqi
-  );
-  ESP_ERROR_CHECK(esp_zb_cluster_list_add_custom_cluster(cluster_list, esp_zb_aqi_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-
   return cluster_list;
 }
 
@@ -247,125 +247,89 @@ static esp_zb_cluster_list_t* eco2_clusters_create(void)
   esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
   ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-  /* Identify cluster */
-  esp_zb_identify_cluster_cfg_t identify_cfg = {
-    .identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
+  /* eCO2 using analog input cluster */
+  esp_zb_analog_input_cluster_cfg_t eco2_cfg = {
+    .present_value = 0,
   };
-  esp_zb_attribute_list_t *esp_zb_identify_cluster = esp_zb_identify_cluster_create(&identify_cfg);
-  ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(cluster_list, esp_zb_identify_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
-
-  /* eCO2 using proper CO2 measurement cluster */
-  esp_zb_carbon_dioxide_measurement_cluster_cfg_t eco2_meas_cfg = {
-    .measured_value = ESP_ZB_CO2_MEASUREMENT_UNDEFINED,
-    .min_measured_value = ESP_ZB_CO2_MEASUREMENT_MIN_VALUE,
-    .max_measured_value = ESP_ZB_CO2_MEASUREMENT_MAX_VALUE,
-  };
-  esp_zb_attribute_list_t *esp_zb_eco2_cluster = esp_zb_carbon_dioxide_measurement_cluster_create(&eco2_meas_cfg);
-  ESP_ERROR_CHECK(esp_zb_cluster_list_add_carbon_dioxide_measurement_cluster(cluster_list, esp_zb_eco2_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+  esp_zb_attribute_list_t *esp_zb_eco2_cluster = esp_zb_analog_input_cluster_create(&eco2_cfg);
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(cluster_list, esp_zb_eco2_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
   return cluster_list;
 }
 
-void zigbee_update(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, uint16_t tvoc, float temperature, float humidity)
+static esp_zb_cluster_list_t* tvoc_clusters_create(void)
 {
-  if (!zigbee_initialized) {
-    ESP_LOGW(TAG, "Zigbee not initialized yet, skipping update");
-    return;
-  }
+  esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+  
+  /* Basic cluster */
+  esp_zb_basic_cluster_cfg_t basic_cfg = {
+    .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+    .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+  };
+  esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-  /* Store current values */
-  current_aqi = aqi;
-  current_eco2 = eco2;
-  current_co2 = co2;
-  current_ch2o = ch2o;
-  current_tvoc = tvoc;
-  current_temperature = temperature;
-  current_humidity = humidity;
+  /* TVOC using analog input cluster */
+  esp_zb_analog_input_cluster_cfg_t tvoc_cfg = {
+    .present_value = 0,
+  };
+  esp_zb_attribute_list_t *esp_zb_tvoc_cluster = esp_zb_analog_input_cluster_create(&tvoc_cfg);
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(cluster_list, esp_zb_tvoc_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
 
-  ESP_LOGI(TAG, "Updating sensor values: AQI=%d, eCO2=%d, CO2=%d, CH2O=%d, TVOC=%d, Temp=%.2f, Humidity=%.2f", 
-           aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
-
-  /* Update temperature (value in 0.01°C units) */
-  int16_t temp_value = (int16_t)(temperature * 100);
-  esp_zb_zcl_set_attribute_val(
-    BASIC_ENDPOINT, 
-    CLUSTER_ID_TEMP_MEASUREMENT,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
-    ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
-    &temp_value, 
-    false
-  );
-
-  /* Update humidity (value in 0.01% units) */
-  uint16_t humidity_value = (uint16_t)(humidity * 100);
-  esp_zb_zcl_set_attribute_val(
-    BASIC_ENDPOINT, 
-    CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 
-    ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
-    &humidity_value, 
-    false
-  );
-
-  /* Update CO2 */
-  // carbon dioxide concentration as a fraction of one
-  float co2_fraction = (float)co2 / 1000000.0;
-  esp_zb_zcl_set_attribute_val(
-    BASIC_ENDPOINT, 
-    CLUSTER_ID_CO2_MEASUREMENT,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-    ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID,
-    &co2_fraction,
-    false
-  );
-
-  /* Update TVOC PPB*/
-  esp_zb_zcl_set_manufacturer_attribute_val(
-    BASIC_ENDPOINT,
-    CLUSTER_ID_TVOC_MEASUREMENT,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-    ATTR_MANUFACTURER_CODE,
-    ATTR_GENERIC_MEASURED_VALUE_CODE,
-    &tvoc,
-    false
-  );
-
-  /* Update Formaldehyde PPB*/
-  esp_zb_zcl_set_manufacturer_attribute_val(
-    BASIC_ENDPOINT,
-    CLUSTER_ID_FORMALDEHYDE_MEASUREMENT,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-    ATTR_MANUFACTURER_CODE,
-    ATTR_GENERIC_MEASURED_VALUE_CODE,
-    &ch2o,
-    false
-  );
-
-  /* Update AQI */
-  esp_zb_zcl_set_manufacturer_attribute_val(
-    BASIC_ENDPOINT,
-    CLUSTER_ID_AQI_MEASUREMENT,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-    ATTR_MANUFACTURER_CODE,
-    ATTR_GENERIC_MEASURED_VALUE_CODE,
-    &aqi,
-    false
-  );
-
-  /* Update eCO2 using CO2 measurement cluster on eCO2 endpoint */
-  float eco2_fraction = (float)eco2 / 1000000.0;
-  esp_zb_zcl_set_attribute_val(
-    ECO2_ENDPOINT,
-    CLUSTER_ID_CO2_MEASUREMENT,
-    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-    ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID,
-    &eco2_fraction,
-    false
-  );
-
-  ESP_LOGI(TAG, "Sensor values updated successfully");
+  return cluster_list;
 }
 
+static esp_zb_cluster_list_t* formaldehyde_clusters_create(void)
+{
+  esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+  
+  /* Basic cluster */
+  esp_zb_basic_cluster_cfg_t basic_cfg = {
+    .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+    .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+  };
+  esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+  /* Formaldehyde using analog input cluster */
+  esp_zb_analog_input_cluster_cfg_t ch2o_cfg = {
+    .present_value = 0,
+  };
+  esp_zb_attribute_list_t *esp_zb_ch2o_cluster = esp_zb_analog_input_cluster_create(&ch2o_cfg);
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(cluster_list, esp_zb_ch2o_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+  return cluster_list;
+}
+
+static esp_zb_cluster_list_t* aqi_clusters_create(void)
+{
+  esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+  
+  /* Basic cluster */
+  esp_zb_basic_cluster_cfg_t basic_cfg = {
+    .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+    .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+  };
+  esp_zb_attribute_list_t *esp_zb_basic_cluster = esp_zb_basic_cluster_create(&basic_cfg);
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(cluster_list, esp_zb_basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+  /* AQI using analog input cluster */
+  esp_zb_analog_input_cluster_cfg_t aqi_cfg = {
+    .present_value = 0,
+  };
+  esp_zb_attribute_list_t *esp_zb_aqi_cluster = esp_zb_analog_input_cluster_create(&aqi_cfg);
+  ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(cluster_list, esp_zb_aqi_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
+  return cluster_list;
+}
+
+/**
+ * @brief Zigbee stack application signal handler.
+ * 
+ * @note This function is called automagically by the Zigbee stack to notify the application of various events.
+ * 
+ * See https://docs.espressif.com/projects/esp-zigbee-sdk/en/latest/esp32/api-reference/esp_zigbee_core.html#_CPPv425esp_zb_app_signal_handlerP19esp_zb_app_signal_t
+ */
 void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
 {
   uint32_t *p_sg_p = signal_struct->p_app_signal;
@@ -451,7 +415,107 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
   }
 }
 
+/**
+ * @brief Callback helper function for delayed start of commissioning
+ */
 static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
 {
   ESP_RETURN_ON_FALSE(esp_zb_bdb_start_top_level_commissioning(mode_mask) == ESP_OK, , TAG, "Failed to start Zigbee commissioning");
+}
+
+/**
+ * External function to update Zigbee sensor values
+ */
+void zigbee_update(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, uint16_t tvoc, float temperature, float humidity)
+{
+  if (!zigbee_initialized)
+  {
+    ESP_LOGW(TAG, "Zigbee not initialized yet, skipping update");
+    return;
+  }
+
+  /* Store current values */
+  current_aqi = aqi;
+  current_eco2 = eco2;
+  current_co2 = co2;
+  current_ch2o = ch2o;
+  current_tvoc = tvoc;
+  current_temperature = temperature;
+  current_humidity = humidity;
+
+  ESP_LOGI(TAG, "Updating sensor values: AQI=%d, eCO2=%d, CO2=%d, CH2O=%d, TVOC=%d, Temp=%.2f, Humidity=%.2f",
+           aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
+
+  /* Update temperature (value in 0.01°C units) */
+  int16_t temp_value = (int16_t)(temperature * 100);
+  esp_zb_zcl_set_attribute_val(
+      BASIC_ENDPOINT,
+      ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+      &temp_value,
+      false);
+
+  /* Update humidity (value in 0.01% units) */
+  uint16_t humidity_value = (uint16_t)(humidity * 100);
+  esp_zb_zcl_set_attribute_val(
+      BASIC_ENDPOINT,
+      ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
+      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID,
+      &humidity_value,
+      false);
+
+  /* Update CO2 */
+  // carbon dioxide concentration as a fraction of one
+  float co2_fraction = (float)co2 / 1000000.0;
+  esp_zb_zcl_set_attribute_val(
+      BASIC_ENDPOINT,
+      ESP_ZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT,
+      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID,
+      &co2_fraction,
+      false);
+
+  /* Update TVOC using analog input cluster */
+  float tvoc_float = (float)tvoc;
+  esp_zb_zcl_set_attribute_val(
+      TVOC_ENDPOINT,
+      ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+      &tvoc_float,
+      false);
+
+  /* Update Formaldehyde using analog input cluster */
+  float ch2o_float = (float)ch2o;
+  esp_zb_zcl_set_attribute_val(
+      FORMALDEHYDE_ENDPOINT,
+      ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+      &ch2o_float,
+      false);
+
+  /* Update AQI using analog input cluster */
+  float aqi_float = (float)aqi;
+  esp_zb_zcl_set_attribute_val(
+      AQI_ENDPOINT,
+      ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+      &aqi_float,
+      false);
+
+  /* Update eCO2 using analog input cluster */
+  float eco2_float = (float)eco2;
+  esp_zb_zcl_set_attribute_val(
+      ECO2_ENDPOINT,
+      ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+      ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+      &eco2_float,
+      false);
+
+  ESP_LOGI(TAG, "Sensor values updated successfully");
 }

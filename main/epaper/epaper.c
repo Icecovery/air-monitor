@@ -11,6 +11,10 @@
 static const char *TAG = "epaper";
 
 UBYTE *imageCache;
+char strBuffer[16];
+const char *good = ")";
+const char *moderate = "*";
+const char *bad = "(";
 
 void epaper_setup(void)
 {
@@ -84,8 +88,6 @@ void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, ui
   Paint_SelectImage(imageCache);
   Paint_Clear(EPD_2IN15G_WHITE);
 
-  char strBuffer[16];
-
   // === first row ===
 
   snprintf(strBuffer, sizeof(strBuffer), "%.2fC", temperature);
@@ -111,7 +113,7 @@ void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, ui
     Paint_DrawRectangle(148, 44, 296, 116, EPD_2IN15G_RED, DOT_PIXEL_1X1, DRAW_FILL_FULL);
   }
   Paint_DrawString_EN(164, 48, "tVOC PPB", &Font16, tvoc <= 660 ? EPD_2IN15G_BLACK : EPD_2IN15G_WHITE, tvoc <= 660 ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
-  snprintf(strBuffer, sizeof(strBuffer), "%d", (int)(tvoc * 1000.0f));
+  snprintf(strBuffer, sizeof(strBuffer), "%d", tvoc);
   Paint_DrawString_LUT(164, 65, strBuffer, &RecMono40Numbers, tvoc <= 660 ? EPD_2IN15G_BLACK : EPD_2IN15G_YELLOW, tvoc <= 660 ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
 
   // === third row ===
@@ -124,15 +126,17 @@ void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, ui
   Paint_DrawString_LUT(120, 128, strBuffer, &RecMono36, ch2o <= 40 ? EPD_2IN15G_BLACK : EPD_2IN15G_RED, EPD_2IN15G_WHITE);
   Paint_DrawString_EN(120, 118, "CH2O PPB", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
 
-  const char *good = ")";
-  const char *moderate = "*";
-  const char *bad = "(";
-  const char *aqi_face = aqi <= 1 
-    ? good 
-    : aqi <= 3 
-      ? moderate
-      : bad;
-  snprintf(strBuffer, sizeof(strBuffer), "%d %s", aqi, aqi_face);
+  snprintf(
+    strBuffer, 
+    sizeof(strBuffer), 
+    "%d %s", 
+    aqi, 
+    aqi <= 1 
+      ? good 
+      : aqi <= 3 
+        ? moderate
+        : bad
+  );
   Paint_DrawString_LUT(235, 128, strBuffer, &RecMono36, aqi <= 3 ? EPD_2IN15G_BLACK : EPD_2IN15G_RED, EPD_2IN15G_WHITE);
   Paint_DrawString_EN(235, 118, "AQI", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
 

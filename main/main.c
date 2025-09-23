@@ -227,6 +227,12 @@ static void scd41_task(void *pvParameters)
       }
     }
 
+    // bool good = heap_caps_check_integrity_all(true);
+    // if (!good)
+    // {
+    //   ESP_LOGE(TASK_TAG, "Heap integrity check failed!");
+    // }
+
     // read the sensor data
     error = scd4x_read_measurement(&dev, &co2, &temperature, &humidity);
     if (error != ESP_OK)
@@ -297,24 +303,6 @@ static void display_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for display update");
     }
 
-    // Log to console
-    ESP_LOGI(TASK_TAG,
-             "Update display with following values:\n"
-             "AQI: \t%d\n"
-             "eCO2:\t%d\tppm\n"
-             "CH2O:\t%d\tppb\n"
-             "tVOC:\t%d\tppb\n"
-             "CO2: \t%d\tppm\n"
-             "Temp:\t%.3f\t°C\n"
-             "RH:  \t%.3f\t%%",
-             aqi,
-             eco2,
-             ch2o,
-             tvoc,
-             co2,
-             temperature,
-             humidity);
-
     ESP_ERROR_CHECK(led_controller_set_solid((led_color_t)LED_COLOR_DIM_BLUE));
     epaper_display(aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
     ESP_ERROR_CHECK(led_controller_set_off());
@@ -331,7 +319,7 @@ static void zigbee_update_task(void *pvParameters)
   while (true)
   {
     // Update Zigbee every 15 seconds
-    vTaskDelay(pdMS_TO_TICKS(15000));
+    vTaskDelay(ZIGBEE_UPDATE_INTERVAL_TICKS);
 
     bool data_changed = false;
 
@@ -406,9 +394,9 @@ void app_main(void)
   HALT_IF_NULL_WITH_LED(TAG, co2_data_mutex, "Failed to create CO2 data mutex");
 
   xTaskCreate(tvoc_task, "tvoc_task", 4096, NULL, 5, NULL);
-  xTaskCreate(scd41_task, "scd41_task", 4096, NULL, 5, NULL);
-  xTaskCreate(display_update_task, "display_update_task", 8192, NULL, 5, NULL);
-  xTaskCreate(zigbee_update_task, "zigbee_update_task", 4096, NULL, 5, NULL);
+  xTaskCreate(scd41_task, "scd41_task", 16384, NULL, 5, NULL);
+  xTaskCreate(display_update_task, "display_update_task", 16384, NULL, 10, NULL);
+  xTaskCreate(zigbee_update_task, "zigbee_update_task", 8192, NULL, 3, NULL);
 
   zigbee_init();
 

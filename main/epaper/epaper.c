@@ -63,9 +63,9 @@ void epaper_setup(void)
   DEV_Module_Exit();
 }
 
-void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, float tvoc, float temperature, float humidity)
+void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, uint16_t tvoc, float temperature, float humidity)
 {
-  ESP_LOGI(TAG, "epaper_display called with parameters - AQI: %d, eCO2: %d ppm, CO2: %d ppm, CH2O: %d ppb, TVOC: %.3f ppm, Temp: %.3f C, Humidity: %.3f%%",
+  ESP_LOGI(TAG, "epaper_display called with parameters - AQI: %d, eCO2: %d ppm, CO2: %d ppm, CH2O: %d ppb, TVOC: %d ppb, Temp: %.3f C, Humidity: %.3f%%",
            aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
 
   ESP_LOGI(TAG, "Wake up and init EPD_2IN15G");
@@ -106,13 +106,13 @@ void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, fl
   snprintf(strBuffer, sizeof(strBuffer), "%d", co2);
   Paint_DrawString_LUT(4, 65, strBuffer, &RecMono40Numbers, co2 <= 1000 ? EPD_2IN15G_BLACK : EPD_2IN15G_YELLOW, co2 <= 1000 ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
 
-  if (tvoc > 0.66f)
+  if (tvoc > 660)
   {
     Paint_DrawRectangle(148, 44, 296, 116, EPD_2IN15G_RED, DOT_PIXEL_1X1, DRAW_FILL_FULL);
   }
-  Paint_DrawString_EN(164, 48, "tVOC PPB", &Font16, tvoc <= 0.66f ? EPD_2IN15G_BLACK : EPD_2IN15G_WHITE, tvoc <= 0.66f ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
+  Paint_DrawString_EN(164, 48, "tVOC PPB", &Font16, tvoc <= 660 ? EPD_2IN15G_BLACK : EPD_2IN15G_WHITE, tvoc <= 660 ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
   snprintf(strBuffer, sizeof(strBuffer), "%d", (int)(tvoc * 1000.0f));
-  Paint_DrawString_LUT(164, 65, strBuffer, &RecMono40Numbers, tvoc <= 0.66f ? EPD_2IN15G_BLACK : EPD_2IN15G_YELLOW, tvoc <= 0.66f ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
+  Paint_DrawString_LUT(164, 65, strBuffer, &RecMono40Numbers, tvoc <= 660 ? EPD_2IN15G_BLACK : EPD_2IN15G_YELLOW, tvoc <= 660 ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
 
   // === third row ===
 

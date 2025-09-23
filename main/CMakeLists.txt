@@ -1,19 +1,11 @@
 idf_component_register(
-  SRCS 
-    "main.c"
-    "led/led.c"
-    "led/led_controller.c"
-    "tvoc/tvoc.c"
-    "epaper/epaper.c"
-    "epaper/EPD_2in15g.c"
-    "epaper/Device_Config.c"
-    "epaper/GUI_Paint.c"
-    "epaper/fonts/font8.c"
-    "epaper/fonts/font12.c"
-    "epaper/fonts/font16.c"
-    "epaper/fonts/font20.c"
-    "epaper/fonts/font24.c"
-    "epaper/fonts/rec_mono_40.c"
-    "epaper/fonts/rec_mono_36.c"
+  SRC_DIRS
+    "."
+    "./led"
+    "./tvoc"
+    "./epaper"
+    "./epaper/fonts"
+    "./zigbee"
+    "./zigbee/zcl_utility/"
   INCLUDE_DIRS "."
 )

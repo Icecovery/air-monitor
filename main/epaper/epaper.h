@@ -4,6 +4,6 @@
 #include <stdint.h>
 
 void epaper_setup(void);
-void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, float tvoc, float temperature, float humidity);
+void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, uint16_t tvoc, float temperature, float humidity);
 
 #endif // EPAPER_H

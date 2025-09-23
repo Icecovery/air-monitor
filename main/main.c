@@ -1,3 +1,4 @@
+#include "main.h"
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -6,7 +7,6 @@
 #include "esp_check.h"
 #include "sdkconfig.h"
 #include "driver/gpio.h"
-#include "math.h"
 
 #include "led/led_controller.h"
 #include "led/led_error_handler.h"
@@ -16,11 +16,11 @@
 #include "epaper/GUI_Paint.h"
 #include "epaper/Device_Config.h"
 #include <scd4x.h>
+#include "zigbee/zigbee.h"
 
 static const char *TAG = "main";
 
 // Mutexes for shared data
-#define MUTEX_TIMEOUT_TICKS pdMS_TO_TICKS(100)
 static SemaphoreHandle_t tvoc_data_mutex = NULL;
 static SemaphoreHandle_t co2_data_mutex = NULL;
 
@@ -28,14 +28,11 @@ static SemaphoreHandle_t co2_data_mutex = NULL;
 static uint16_t g_aqi_reading = 0;
 static uint16_t g_eco2_reading = 0;
 static uint16_t g_ch2o_reading = 0;
-static float g_tvoc_reading = 0.0f;
+static uint16_t g_tvoc_reading = 0.0f;
 
 static float g_temperature_reading = 0.0f;
 static float g_humidity_reading = 0.0f;
 static uint16_t g_co2_reading = 0;
-
-#define SCD41_TEMP_OFFSET 10.8f
-#define SCD41_ALTITUDE 70
 
 static void tvoc_task(void *pvParameters)
 {
@@ -47,21 +44,24 @@ static void tvoc_task(void *pvParameters)
   static uint16_t eco2 = 0;
   static uint16_t ch2o = 0;
   static float tvoc = 0.0f;
+  static uint16_t tvoc_ppb = 0;
 
   while (true)
   {
     if (tvoc_get_active_device_data(&aqi, &eco2, &ch2o, &tvoc))
     {
-      if (aqi != g_aqi_reading || eco2 != g_eco2_reading || ch2o != g_ch2o_reading || tvoc != g_tvoc_reading)
+      tvoc_ppb = (uint16_t)(tvoc * 1000.0f); // Convert TVOC to ppb
+
+      if (aqi != g_aqi_reading || eco2 != g_eco2_reading || ch2o != g_ch2o_reading || tvoc_ppb != g_tvoc_reading)
       {
-        ESP_LOGI(TASK_TAG, "TVOC sensor data - AQI: %d, eCO2: %d ppm, CH2O: %d ppb, TVOC: %.3f ppm",
-                 aqi, eco2, ch2o, tvoc);
+        ESP_LOGI(TASK_TAG, "TVOC sensor data - AQI: %d, eCO2: %d ppm, CH2O: %d ppb, TVOC: %d ppb",
+                 aqi, eco2, ch2o, tvoc_ppb);
         if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
         {
           g_aqi_reading = aqi;
           g_eco2_reading = eco2;
           g_ch2o_reading = ch2o;
-          g_tvoc_reading = tvoc;
+          g_tvoc_reading = tvoc_ppb;
           xSemaphoreGive(tvoc_data_mutex);
         }
         else
@@ -84,7 +84,7 @@ static void scd41_task(void *pvParameters)
 
   // Initialize SCD41 sensor descriptor
   i2c_dev_t dev = {0};
-  ESP_ERROR_CHECK(scd4x_init_desc(&dev, 0, GPIO_NUM_6, GPIO_NUM_7));
+  ESP_ERROR_CHECK(scd4x_init_desc(&dev, I2C_PORT, SDA_GPIO, SCL_GPIO));
 
   ESP_LOGI(TASK_TAG, "Initializing SCD41 sensor...");
 
@@ -134,7 +134,7 @@ static void scd41_task(void *pvParameters)
   HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting temperature offset", error);
   ESP_LOGI(TASK_TAG, "Current temperature offset: %.2f °C", temp_offset);
 
-  if (fabsf(temp_offset - SCD41_TEMP_OFFSET) > 0.01f)
+  if (FLOAT_NEQ(temp_offset, SCD41_TEMP_OFFSET))
   {
     ESP_LOGW(TASK_TAG, "Current temperature offset %.2f °C is not the expected value of %.2f °C", temp_offset, SCD41_TEMP_OFFSET);
 
@@ -238,7 +238,7 @@ static void scd41_task(void *pvParameters)
       continue;
     }
 
-    if (co2 != g_co2_reading || temperature != g_temperature_reading || humidity != g_humidity_reading)
+    if (co2 != g_co2_reading || FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading))
     {
       // print results in physical units.
       ESP_LOGI(TASK_TAG, "SCD41 sensor data - CO2: %d ppm, Temperature: %.2f °C, Humidity: %.2f %%", co2, temperature, humidity);
@@ -257,20 +257,20 @@ static void scd41_task(void *pvParameters)
   }
 }
 
-static void periodic_update_task(void *pvParameters)
+static void display_update_task(void *pvParameters)
 {
-  const char *TASK_TAG = "update_task";
+  const char *TASK_TAG = "display_update_task";
 
   epaper_setup();
 
   while (true)
   {
-    // Update display every 5 minutes
-    vTaskDelay(pdMS_TO_TICKS(300000));
+    // Update display every 10 minutes
+    vTaskDelay(DISPLAY_UPDATE_INTERVAL_TICKS);
 
     // Take mutexes to read shared data
-    uint16_t aqi = 0, eco2 = 0, co2 = 0, ch2o = 0;
-    float tvoc = 0.0f, temperature = 0.0f, humidity = 0.0f;
+    uint16_t aqi = 0, eco2 = 0, co2 = 0, ch2o = 0, tvoc = 0;
+    float temperature = 0.0f, humidity = 0.0f;
 
     if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
@@ -297,13 +297,13 @@ static void periodic_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for display update");
     }
 
-    // Log to console for now
+    // Log to console
     ESP_LOGI(TASK_TAG,
-             "=== Readings ===\n"
+             "Update display with following values:\n"
              "AQI: \t%d\n"
              "eCO2:\t%d\tppm\n"
              "CH2O:\t%d\tppb\n"
-             "tVOC:\t%.3f\tppm\n"
+             "tVOC:\t%d\tppb\n"
              "CO2: \t%d\tppm\n"
              "Temp:\t%.3f\t°C\n"
              "RH:  \t%.3f\t%%",
@@ -318,6 +318,64 @@ static void periodic_update_task(void *pvParameters)
     ESP_ERROR_CHECK(led_controller_set_solid((led_color_t)LED_COLOR_DIM_BLUE));
     epaper_display(aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
     ESP_ERROR_CHECK(led_controller_set_off());
+  }
+}
+
+static void zigbee_update_task(void *pvParameters)
+{
+  const char *TASK_TAG = "zigbee_update_task";
+  
+  uint16_t aqi = 0, eco2 = 0, co2 = 0, ch2o = 0, tvoc = 0;
+  float temperature = 0.0f, humidity = 0.0f;
+
+  while (true)
+  {
+    // Update Zigbee every 15 seconds
+    vTaskDelay(pdMS_TO_TICKS(15000));
+
+    bool data_changed = false;
+
+    // Take mutexes to read shared data
+    if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+    {
+      if (aqi != g_aqi_reading || eco2 != g_eco2_reading || ch2o != g_ch2o_reading || tvoc != g_tvoc_reading)
+      {
+        data_changed = true;
+
+        aqi = g_aqi_reading;
+        ch2o = g_ch2o_reading;
+        tvoc = g_tvoc_reading;
+        eco2 = g_eco2_reading;
+      }
+      xSemaphoreGive(tvoc_data_mutex);
+    }
+    else
+    {
+      ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex for Zigbee update");
+    }
+
+    if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+    {
+      if (co2 != g_co2_reading || FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading))
+      {
+        data_changed = true;
+
+        co2 = g_co2_reading;
+        temperature = g_temperature_reading;
+        humidity = g_humidity_reading;
+      }
+      xSemaphoreGive(co2_data_mutex);
+    }
+    else
+    {
+      ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for Zigbee update");
+    }
+
+    // Update Zigbee attributes only if data has changed
+    if (data_changed)
+    {
+      zigbee_update(aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
+    }
   }
 }
 
@@ -349,7 +407,10 @@ void app_main(void)
 
   xTaskCreate(tvoc_task, "tvoc_task", 4096, NULL, 5, NULL);
   xTaskCreate(scd41_task, "scd41_task", 4096, NULL, 5, NULL);
-  xTaskCreate(periodic_update_task, "update_task", 16384, NULL, 5, NULL);
+  xTaskCreate(display_update_task, "display_update_task", 8192, NULL, 5, NULL);
+  xTaskCreate(zigbee_update_task, "zigbee_update_task", 4096, NULL, 5, NULL);
+
+  zigbee_init();
 
   ESP_LOGI(TAG, "All tasks created successfully");
 }

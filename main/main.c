@@ -41,15 +41,19 @@ static void tvoc_task(void *pvParameters)
   tvoc_set_device_active_mode();
 
   static uint16_t aqi = 0;
-  static uint16_t eco2 = 0;
+  static uint16_t eco2 = 400; // default
   static uint16_t ch2o = 0;
   static float tvoc = 0.0f;
   static uint16_t tvoc_ppb = 0;
+
+  static uint32_t iterationSinceLastUpdate = 0;
 
   while (true)
   {
     if (tvoc_get_active_device_data(&aqi, &eco2, &ch2o, &tvoc))
     {
+      iterationSinceLastUpdate = 0;
+
       tvoc_ppb = (uint16_t)(tvoc * 1000.0f); // Convert TVOC to ppb
 
       if (aqi != g_aqi_reading || eco2 != g_eco2_reading || ch2o != g_ch2o_reading || tvoc_ppb != g_tvoc_reading)
@@ -69,7 +73,18 @@ static void tvoc_task(void *pvParameters)
           ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex");
         }
       }
+      else {
+        ESP_LOGI(TASK_TAG, "TVOC sensor data unchanged");
+      }
       vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    else {
+      iterationSinceLastUpdate++;
+      if (iterationSinceLastUpdate >= 1000) // If no valid data for 1000 iterations 
+      {
+        ESP_LOGW(TASK_TAG, "No valid TVOC data received for 1000 iterations, something went wrong");
+        iterationSinceLastUpdate = 0;
+      }
     }
   }
 }
@@ -395,8 +410,8 @@ void app_main(void)
 
   xTaskCreate(tvoc_task, "tvoc_task", 4096, NULL, 5, NULL);
   xTaskCreate(scd41_task, "scd41_task", 16384, NULL, 5, NULL);
-  xTaskCreate(display_update_task, "display_update_task", 16384, NULL, 10, NULL);
-  xTaskCreate(zigbee_update_task, "zigbee_update_task", 8192, NULL, 3, NULL);
+  xTaskCreate(display_update_task, "display_update_task", 16384, NULL, 5, NULL);
+  xTaskCreate(zigbee_update_task, "zigbee_update_task", 8192, NULL, 5, NULL);
 
   zigbee_init();
 

@@ -1,0 +1,15 @@
+# Board has 16 MB flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Custom partition table (adds zb_storage / zb_fct required by Zigbee)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Zigbee. Router uses the default ZCZR library variant, so do NOT set CONFIG_ZB_ZED.
+CONFIG_ZB_ENABLED=y
+
+# Recommended for the Zigbee stack
+CONFIG_FREERTOS_HZ=1000
+
+# Logging level
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y

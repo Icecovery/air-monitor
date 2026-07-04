@@ -1,11 +1,5 @@
 idf_component_register(
-  SRC_DIRS
-    "."
-    "./led"
-    "./tvoc"
-    "./epaper"
-    "./epaper/fonts"
-    "./zigbee"
-    "./zigbee/zcl_utility/"
+  SRCS "main.c"
   INCLUDE_DIRS "."
+  PRIV_REQUIRES led tvoc epaper zigbee esp_driver_gpio
 )

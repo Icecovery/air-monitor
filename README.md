@@ -1,32 +1,37 @@
-# _Sample project_
+# Air Monitor
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+ESP-IDF firmware for an ESP32-C6 based **Zigbee air quality monitor**:
 
-This is the simplest buildable example. The example is used by command `idf.py create-project`
-that copies the project to user specified path and set it's name. For more information follow the [docs page](https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#start-a-new-project)
+- **TVOC multi-in-one sensor** (UART): AQI, eCO2, CH2O (formaldehyde), TVOC
+- **Sensirion SCD41** (I2C): CO2, temperature, humidity
+- **2.15" e-paper display** (Waveshare EPD_2in15g): local readout, refreshed every 10 minutes
+- **Zigbee router** (esp-zigbee-lib 2.x on ESP-IDF v6): reports all readings to Home Assistant / ZHA
+- **WS2812 RGB LED**: status / error indication
 
-
-
-## How to use example
-We encourage the users to use the example as a template for the new projects.
-A recommended way is to follow the instructions on a [docs page](https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#start-a-new-project).
-
-## Example folder contents
-
-The project **sample_project** contains one source file in C language [main.c](main/main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt`
-files that provide set of directives and instructions describing the project's source files and targets
-(executable, library, or both). 
-
-Below is short explanation of remaining files in the project folder.
+## Layout
 
 ```
-├── CMakeLists.txt
-├── main
-│   ├── CMakeLists.txt
-│   └── main.c
-└── README.md                  This is the file you are currently reading
+├── main/                  orchestrator (tasks, shared state, SCD41 usage)
+├── components/
+│   ├── epaper/            e-paper driver + GUI + fonts
+│   ├── led/               WS2812 driver + thread-safe LED controller
+│   ├── tvoc/              UART TVOC sensor driver
+│   └── zigbee/            Zigbee router device (owns esp-zigbee-lib dependency)
+├── zigpy/zhaquirk.py      ZHA quirk for Home Assistant
+├── docs/                  committed reference docs (TVOC sensor protocol)
+├── scripts/               font / LUT / UI helper scripts
+├── partitions.csv         custom partition table (zb_storage/zb_fct for Zigbee)
+└── sdkconfig.defaults     checked-in build configuration
 ```
-Additionally, the sample project contains Makefile and component.mk files, used for the legacy Make based build system. 
-They are not used or needed when building with CMake and idf.py.
+
+## Build
+
+Requires **ESP-IDF v6.0.1**, target `esp32c6`:
+
+```bash
+idf.py set-target esp32c6
+idf.py build
+idf.py flash monitor
+```
+
+See [CLAUDE.md](CLAUDE.md) for detailed architecture and development notes.

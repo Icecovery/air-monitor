@@ -60,7 +60,8 @@ void tvoc_init()
   if (TVOC_ALM != GPIO_NUM_NC) // Only configure if ALM pin is defined
   {
     io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pin_bit_mask = (1ULL << TVOC_ALM);
+    // TVOC_ALM can be GPIO_NUM_NC (-1); clamp the (then dead) shift so it stays valid
+    io_conf.pin_bit_mask = (1ULL << (TVOC_ALM >= 0 ? TVOC_ALM : 0));
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     ESP_ERROR_CHECK(gpio_config(&io_conf));
@@ -142,7 +143,10 @@ bool tvoc_get_active_device_data(uint16_t *i_air_quality,
   // check header (0xFE) and footer (0x16)
   if (rx_buf[0] != 0xFE || rx_buf[sizeof(rx_buf) - 1] != 0x16)
   {
-    ESP_LOGE(TAG, "Invalid TVOC sensor data");
+    // Expected on startup: we can begin reading mid-frame, so the first read is
+    // misaligned. Flushing drops the stale bytes and the next read resyncs to a
+    // frame boundary. Log at debug -- it's transient and self-correcting.
+    ESP_LOGD(TAG, "Misaligned TVOC frame, flushing to resync");
     uart_flush(TVOC_UART);
     return false;
   }

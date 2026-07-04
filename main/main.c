@@ -8,15 +8,12 @@
 #include "sdkconfig.h"
 #include "driver/gpio.h"
 
-#include "led/led_controller.h"
-#include "led/led_error_handler.h"
-#include "tvoc/tvoc.h"
-#include "epaper/epaper.h"
-#include "epaper/EPD_2in15g.h"
-#include "epaper/GUI_Paint.h"
-#include "epaper/Device_Config.h"
+#include "status_led.h"
+#include "led_error_handler.h"
+#include "tvoc.h"
+#include "epaper.h"
 #include <scd4x.h>
-#include "zigbee/zigbee.h"
+#include "zigbee.h"
 
 static const char *TAG = "main";
 
@@ -34,10 +31,18 @@ static float g_temperature_reading = 0.0f;
 static float g_humidity_reading = 0.0f;
 static uint16_t g_co2_reading = 0;
 
+// Set true once each sensor has produced at least one valid reading. Until then
+// we don't push its group to Zigbee, so HA shows "unknown" rather than a fake 0.
+// Monotonic latches (false->true once), single writer each; plain volatile is safe.
+static volatile bool g_tvoc_valid = false; // TVOC sensor (AQI/eCO2/CH2O/TVOC)
+static volatile bool g_co2_valid = false;  // SCD41 (CO2/temperature/humidity)
+
 static void tvoc_task(void *pvParameters)
 {
   static const char *TASK_TAG = "tvoc_task";
   tvoc_init();
+
+  vTaskDelay(pdMS_TO_TICKS(500)); // let the sensor finish booting before commanding it
   tvoc_set_device_active_mode();
 
   static uint16_t aqi = 0;
@@ -53,6 +58,17 @@ static void tvoc_task(void *pvParameters)
     if (tvoc_get_active_device_data(&aqi, &eco2, &ch2o, &tvoc))
     {
       iterationSinceLastUpdate = 0;
+
+      // During warm-up (~120 s) the sensor streams frames with air level 0 (an
+      // invalid AQI -- real levels are 1-4). Ignore those so we never report a
+      // fake reading: only a real frame marks the group valid and updates globals.
+      if (aqi == 0)
+      {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+
+      g_tvoc_valid = true; // we now have real data (even if a value is zero)
 
       tvoc_ppb = (uint16_t)(tvoc * 1000.0f); // Convert TVOC to ppb
 
@@ -74,16 +90,19 @@ static void tvoc_task(void *pvParameters)
         }
       }
       else {
-        ESP_LOGI(TASK_TAG, "TVOC sensor data unchanged");
+        // ESP_LOGI(TASK_TAG, "data unchanged");
       }
       vTaskDelay(pdMS_TO_TICKS(1000));
     }
     else {
       iterationSinceLastUpdate++;
-      if (iterationSinceLastUpdate >= 1000) // If no valid data for 1000 iterations 
+      // No stream arriving. The sensor persists its mode across boots, so it may
+      // be stuck in query mode (e.g. left there by a debug session). Re-issue the
+      // active-mode command periodically to recover. ~every 5 s (50 * 100 ms).
+      if (iterationSinceLastUpdate % 50 == 0)
       {
-        ESP_LOGW(TASK_TAG, "No valid TVOC data received for 1000 iterations, something went wrong");
-        iterationSinceLastUpdate = 0;
+        ESP_LOGW(TASK_TAG, "No TVOC stream; re-sending active-mode command");
+        tvoc_set_device_active_mode();
       }
     }
   }
@@ -224,13 +243,11 @@ static void scd41_task(void *pvParameters)
       continue;
     }
 
-    // if not, wait until it is
+    // if not, wait until it is (no LED indication -- this wait happens nearly
+    // every cycle, so lighting it up would leave the LED on all the time)
     while (!data_ready)
     {
-      // turn on blue LED to indicate waiting for data
-      led_controller_set_solid((led_color_t)LED_COLOR_BLUE);
       vTaskDelay(pdMS_TO_TICKS(100));
-      led_controller_set_off();
       error = scd4x_get_data_ready_status(&dev, &data_ready);
       if (error != ESP_OK)
       {
@@ -258,6 +275,7 @@ static void scd41_task(void *pvParameters)
                esp_err_to_name(error));
       continue;
     }
+    g_co2_valid = true; // we now have real data (even if the values are zero)
 
     if (co2 != g_co2_reading || FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading))
     {
@@ -281,6 +299,8 @@ static void scd41_task(void *pvParameters)
 static void display_update_task(void *pvParameters)
 {
   const char *TASK_TAG = "display_update_task";
+
+  vTaskDelay(pdMS_TO_TICKS(10000)); // Wait for 10s so we won't have big voltage spikes on startup
 
   epaper_setup();
 
@@ -318,37 +338,45 @@ static void display_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for display update");
     }
 
-    ESP_ERROR_CHECK(led_controller_set_solid((led_color_t)LED_COLOR_DIM_BLUE));
+    status_led_solid(STATUS_LED_DIM_BLUE);
     epaper_display(aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
-    ESP_ERROR_CHECK(led_controller_set_off());
+    status_led_off();
   }
 }
 
 static void zigbee_update_task(void *pvParameters)
 {
   const char *TASK_TAG = "zigbee_update_task";
-  
-  uint16_t aqi = 0, eco2 = 0, co2 = 0, ch2o = 0, tvoc = 0;
+
+  // Copies of the values last pushed to Zigbee, per sensor group. The *_reported
+  // flags stay false until the first send so the first valid reading always goes
+  // out, even if it happens to be zero. Each group is only sent once its sensor
+  // has real data (g_*_valid) and the values changed -- so HA shows "unknown"
+  // (not 0) before data, then updates on every genuine change.
+  uint16_t aqi = 0, eco2 = 0, ch2o = 0, tvoc = 0;
+  uint16_t co2 = 0;
   float temperature = 0.0f, humidity = 0.0f;
+  bool air_quality_reported = false;
+  bool climate_reported = false;
 
   while (true)
   {
     // Update Zigbee every 15 seconds
     vTaskDelay(ZIGBEE_UPDATE_INTERVAL_TICKS);
 
-    bool data_changed = false;
-
-    // Take mutexes to read shared data
+    // --- Air quality group (TVOC sensor: AQI / eCO2 / CH2O / TVOC) ---
+    bool air_quality_changed = false;
     if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
-      if (aqi != g_aqi_reading || eco2 != g_eco2_reading || ch2o != g_ch2o_reading || tvoc != g_tvoc_reading)
+      if (g_tvoc_valid &&
+          (!air_quality_reported || aqi != g_aqi_reading || eco2 != g_eco2_reading ||
+           ch2o != g_ch2o_reading || tvoc != g_tvoc_reading))
       {
-        data_changed = true;
-
+        air_quality_changed = true;
         aqi = g_aqi_reading;
+        eco2 = g_eco2_reading;
         ch2o = g_ch2o_reading;
         tvoc = g_tvoc_reading;
-        eco2 = g_eco2_reading;
       }
       xSemaphoreGive(tvoc_data_mutex);
     }
@@ -357,12 +385,21 @@ static void zigbee_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex for Zigbee update");
     }
 
+    if (air_quality_changed)
+    {
+      air_quality_reported = true;
+      zigbee_report_air_quality(aqi, eco2, ch2o, tvoc);
+    }
+
+    // --- Climate group (SCD41: CO2 / temperature / humidity) ---
+    bool climate_changed = false;
     if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
-      if (co2 != g_co2_reading || FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading))
+      if (g_co2_valid &&
+          (!climate_reported || co2 != g_co2_reading ||
+           FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading)))
       {
-        data_changed = true;
-
+        climate_changed = true;
         co2 = g_co2_reading;
         temperature = g_temperature_reading;
         humidity = g_humidity_reading;
@@ -374,10 +411,10 @@ static void zigbee_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for Zigbee update");
     }
 
-    // Update Zigbee attributes only if data has changed
-    if (data_changed)
+    if (climate_changed)
     {
-      zigbee_update(aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
+      climate_reported = true;
+      zigbee_report_climate(co2, temperature, humidity);
     }
   }
 }
@@ -386,19 +423,17 @@ void app_main(void)
 {
   ESP_LOGI(TAG, "Air Monitor starting...");
 
-  // Initialize the LED controller first
-  esp_err_t ret = led_controller_init();
+  // Initialize the status LED first
+  esp_err_t ret = status_led_init();
   if (ret != ESP_OK)
   {
-    ESP_LOGE(TAG, "Failed to initialize LED controller: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "Failed to initialize status LED: %s", esp_err_to_name(ret));
     return;
   }
 
   // flash the LED in green to indicate startup and wait for serial console to be ready
-  ESP_ERROR_CHECK(led_controller_set_blink((led_color_t)LED_COLOR_GREEN, 500, 10));
-  vTaskDelay(pdMS_TO_TICKS(900));
-  ESP_ERROR_CHECK(led_controller_set_off());
-  vTaskDelay(pdMS_TO_TICKS(4100));
+  status_led_blink(STATUS_LED_GREEN, 2, 50, 400);
+  vTaskDelay(pdMS_TO_TICKS(5000));
 
   ESP_LOGI(TAG, "Creating tasks...");
 

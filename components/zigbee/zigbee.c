@@ -19,6 +19,7 @@
 #include "ezbee/zcl/cluster/rel_humidity_measurement_desc.h"
 #include "ezbee/zcl/cluster/carbon_dioxide_measurement_desc.h"
 #include "ezbee/zcl/cluster/analog_input_desc.h"
+#include "ezbee/zcl/cluster/custom.h"
 #include "ezbee/zdo/zdo_dev_srv_disc.h"
 
 #include "status_led.h"
@@ -44,6 +45,14 @@ static const char *TAG = "zigbee";
 #define APP_NVS_NAMESPACE   "airmon"
 #define APP_NVS_KEY_REBOOTS "reboots"
 
+// Custom cluster behind the "Recalibrate TVOC" button (TVOC_RECALIBRATE_ENDPOINT).
+// Custom (>=0xFC00) clusters don't read back under ZHA, but *writes* land reliably
+// (the catch-all write_attr_cb fires) -- all a momentary button needs, and ZHA
+// won't auto-discover a custom cluster so there's no stray native entity. The
+// quirk's write_attr_button writes RECAL_ATTR_ID; any write triggers a recal.
+#define RECAL_CLUSTER_ID 0xFC10 // manufacturer-specific (avoid 0xFC00, squatted)
+#define RECAL_ATTR_ID    0x0000
+
 /* Static function declarations */
 static void zigbee_task(void *pvParameters);
 static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal);
@@ -61,6 +70,9 @@ static esp_err_t device_create(void);
 static void main_endpoint_add(ezb_af_device_desc_t dev);
 static void analog_input_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id);
 static void diagnostic_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id, float value, const char *desc);
+static void recalibrate_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id);
+static void recal_cluster_init(uint8_t ep_id);
+static void recal_write_attr_cb(uint8_t ep_id, uint16_t attr_id, void *new_value, uint16_t manuf_code);
 
 static bool zigbee_initialized = false;
 static esp_timer_handle_t steering_retry_timer;
@@ -71,6 +83,12 @@ static int probe_fail_count;              // consecutive unanswered probes
 static int unavail_count;                 // delivery failures in the current window
 static int64_t unavail_window_start_us;   // start of the current failure window
 static uint32_t recovery_reboot_count;    // persisted count of self-recovery reboots
+static zigbee_recalibrate_cb_t recalibrate_cb; // TVOC-recalibrate button handler
+
+void zigbee_set_recalibrate_handler(zigbee_recalibrate_cb_t cb)
+{
+  recalibrate_cb = cb;
+}
 
 void zigbee_init(void)
 {
@@ -208,15 +226,15 @@ static esp_err_t device_create(void)
   /* Main basic endpoint: Basic + Identify + Temperature + Humidity + CO2 */
   main_endpoint_add(dev);
 
-  /* eCO2, TVOC, Formaldehyde and AQI endpoints: Basic + AnalogInput each */
-  analog_input_endpoint_add(dev, ECO2_ENDPOINT);
+  /* TVOC endpoint: Basic + AnalogInput (host-computed from the raw MOX ADC) */
   analog_input_endpoint_add(dev, TVOC_ENDPOINT);
-  analog_input_endpoint_add(dev, FORMALDEHYDE_ENDPOINT);
-  analog_input_endpoint_add(dev, AQI_ENDPOINT);
 
   /* Diagnostic endpoints: recovery-reboot count + last reset reason */
   diagnostic_endpoint_add(dev, RECOVERY_REBOOTS_ENDPOINT, (float)recovery_reboot_count, "\x10""Recovery reboots");
   diagnostic_endpoint_add(dev, RESET_REASON_ENDPOINT, (float)esp_reset_reason(), "\x11""Last reset reason");
+
+  /* "Recalibrate TVOC" button (write-only custom cluster; quirk renders a button) */
+  recalibrate_endpoint_add(dev, TVOC_RECALIBRATE_ENDPOINT);
 
   ESP_ERROR_CHECK(ezb_af_device_desc_register(dev));
   return ESP_OK;
@@ -280,7 +298,8 @@ static void main_endpoint_add(ezb_af_device_desc_t dev)
   ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
 }
 
-/* eCO2/TVOC/CH2O/AQI endpoints are identical: Basic + AnalogInput (present_value) */
+/* TVOC endpoint: Basic + AnalogInput (present_value). Kept generic (takes an
+ * endpoint id) in case more AnalogInput sensors are added later. */
 static void analog_input_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id)
 {
   ezb_zcl_basic_cluster_server_config_t basic_cfg = {
@@ -330,6 +349,59 @@ static void diagnostic_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_i
   };
   ezb_af_ep_desc_t ep = ezb_af_create_endpoint_desc(&ep_cfg);
   ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, analog_input));
+  ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
+}
+
+/* Any write to the recalibrate cluster's attribute (from the quirk's button)
+ * means "recalibrate the TVOC clean-air baseline". Fires in stack context, so
+ * the handler just flags the request -- keep it short. */
+static void recal_write_attr_cb(uint8_t ep_id, uint16_t attr_id, void *new_value, uint16_t manuf_code)
+{
+  (void)attr_id;
+  (void)new_value;
+  (void)manuf_code;
+  ESP_LOGW(TAG, "Recalibrate-TVOC button pressed (ep %u)", ep_id);
+  if (recalibrate_cb)
+  {
+    recalibrate_cb();
+  }
+}
+
+/* Init hook for the recalibrate custom cluster: register its write-only handler. */
+static void recal_cluster_init(uint8_t ep_id)
+{
+  (void)ep_id;
+  ezb_zcl_custom_cluster_handlers_t handlers = {
+    .cluster_id = RECAL_CLUSTER_ID,
+    .cluster_role = EZB_ZCL_CLUSTER_SERVER,
+    .write_attr_cb = recal_write_attr_cb,
+  };
+  ezb_zcl_custom_cluster_handlers_register(&handlers);
+}
+
+/* Write-only momentary "button" endpoint: a lone manufacturer-specific custom
+ * cluster. ZHA won't auto-discover it (no stray entity); the v2 quirk's
+ * write_attr_button renders a single Button that writes RECAL_ATTR_ID. */
+static void recalibrate_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id)
+{
+  ezb_zcl_custom_cluster_config_t recal_cfg = {
+    .cluster_id = RECAL_CLUSTER_ID,
+    .init_func = recal_cluster_init,
+    .deinit_func = NULL,
+  };
+  ezb_zcl_cluster_desc_t recal = ezb_zcl_custom_create_cluster_desc(&recal_cfg, EZB_ZCL_CLUSTER_SERVER);
+  uint8_t recal_val = 0;
+  ESP_ERROR_CHECK(ezb_zcl_custom_cluster_desc_add_attr(recal, RECAL_ATTR_ID, EZB_ZCL_ATTR_TYPE_UINT8,
+                                                       EZB_ZCL_ATTR_ACCESS_READ_WRITE, &recal_val));
+
+  ezb_af_ep_config_t ep_cfg = {
+    .ep_id = endpoint_id,
+    .app_profile_id = EZB_AF_HA_PROFILE_ID,
+    .app_device_id = EZB_ZHA_SIMPLE_SENSOR_DEVICE_ID,
+    .app_device_version = 0,
+  };
+  ezb_af_ep_desc_t ep = ezb_af_create_endpoint_desc(&ep_cfg);
+  ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, recal));
   ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
 }
 
@@ -645,23 +717,20 @@ void zigbee_report_climate(uint16_t co2, float temperature, float humidity)
 }
 
 /**
- * @brief Report the TVOC sensor's air-quality group (AQI/eCO2/CH2O/TVOC) on EP2-5.
+ * @brief Report the host-computed TVOC value (ppb) on EP3.
  */
-void zigbee_report_air_quality(uint16_t aqi, uint16_t eco2, uint16_t ch2o, uint16_t tvoc)
+void zigbee_report_tvoc(uint16_t tvoc)
 {
   if (!zigbee_initialized)
   {
-    ESP_LOGW(TAG, "Zigbee not initialized yet, skipping air-quality update");
+    ESP_LOGW(TAG, "Zigbee not initialized yet, skipping TVOC update");
     return;
   }
 
-  ESP_LOGI(TAG, "Reporting air quality: AQI=%d, eCO2=%d, CH2O=%d, TVOC=%d", aqi, eco2, ch2o, tvoc);
+  ESP_LOGI(TAG, "Reporting TVOC: %d ppb", tvoc);
 
   /* Stack calls from outside the Zigbee mainloop task must hold the stack lock */
   esp_zigbee_lock_acquire(portMAX_DELAY);
-  report_analog_input(ECO2_ENDPOINT, (float)eco2);
   report_analog_input(TVOC_ENDPOINT, (float)tvoc);
-  report_analog_input(FORMALDEHYDE_ENDPOINT, (float)ch2o);
-  report_analog_input(AQI_ENDPOINT, (float)aqi);
   esp_zigbee_lock_release();
 }

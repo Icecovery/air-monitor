@@ -5,6 +5,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -12,20 +13,29 @@
 
 static const char *TAG = "tvoc";
 
-// Command buffers for setting sensor modes and querying data
-uint8_t ACTIVE_BUF[9] = {0xFE, 0x00, 0x78, 0x40, 0x00, 0x00, 0x00, 0x00, 0xB8};    // Command to set active mode
-uint8_t STOP_BUF[9] = {0xFE, 0x00, 0x78, 0x41, 0x00, 0x00, 0x00, 0x00, 0xB9};      // Command to set query mode
-uint8_t GET_QUERY_BUF[9] = {0xFE, 0x00, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86}; // Command to query data in query mode
+// Host-side TVOC recovery (see docs/re-report.md). The module's firmware pins its
+// computed TVOC at ~0.352 ppm after long storage, but the raw MOX ADC (exposed in
+// the query-mode response) is still fully responsive. We poll that ADC and derive
+// TVOC ourselves: TVOC(ppm) = C * ln(ADC0 / ADC), with ADC0 a self-calibrated
+// clean-air baseline (the cleanest / highest ADC observed).
+#define TVOC_C 1.86f              // ppm per ln-unit (from the firmware curve slope)
+#define TVOC_WARM_SAMPLES 5       // clean-air samples used to seed the baseline
+
+// Command buffers. Query mode (active upload stopped) is the only mode whose
+// response carries the raw ADC, so this firmware runs the sensor there.
+uint8_t STOP_BUF[9] = {0xFE, 0x00, 0x78, 0x41, 0x00, 0x00, 0x00, 0x00, 0xB9};      // stop active upload -> query mode
+uint8_t GET_QUERY_BUF[9] = {0xFE, 0x00, 0x86, 0x00, 0x00, 0x00, 0x00, 0x00, 0x86}; // query current concentration + raw ADC
 
 uint8_t rx_buf[11]; // Serial port receiving array (for storing incoming data)
 
-_lock_t data_lock;
-uint8_t aqi = 0;          // air quality index
-uint16_t eco2 = 0;        // eCO2 ppm
-uint16_t ch2o = 0;        // formaldehyde (CH2O) ppb
-float tvoc = 0;           // TVOC (Total Volatile Organic Compounds) ppm
+// Clean-air baseline state. Touched only by tvoc_read (single consumer), except
+// s_recal_pending which any context may set to request a re-seed.
+static float s_base = 0.0f;      // ADC0: clean-air baseline (cleanest ADC seen)
+static int s_warm_count = 0;     // samples gathered so far during (re)calibration
+static float s_warm_max = 0.0f;  // running max used to seed the baseline
+static volatile bool s_recal_pending = false;
 
-void tvoc_init()
+void tvoc_init(void)
 {
   // Initialize UART for TVOC sensor
   const uart_config_t uart_config = {
@@ -101,77 +111,109 @@ uint8_t CRC_Check(uint8_t *data, uint32_t size)
   return crc; // Return the calculated checksum
 }
 
-void tvoc_set_device_active_mode()
+void tvoc_start(void)
 {
   uart_flush(TVOC_UART);
-  uart_write_bytes(TVOC_UART, (const char*)ACTIVE_BUF, 9);
+  uart_write_bytes(TVOC_UART, (const char *)STOP_BUF, 9); // stop active upload -> query mode
 
-  ESP_LOGI(TAG, "TVOC sensor set to active mode");
+  ESP_LOGI(TAG, "TVOC sensor set to query mode");
 }
 
-void tvoc_set_device_stop_mode()
+// Send one query command and read back the 11-byte response, validating the
+// header (FE FE 68), footer (0x16) and checksum. On success returns the raw
+// 12-bit ADC sample (query-response bytes 7-8).
+static bool tvoc_query_adc(uint16_t *adc)
 {
   uart_flush(TVOC_UART);
-  uart_write_bytes(TVOC_UART, (const char*)STOP_BUF, 9);
+  uart_write_bytes(TVOC_UART, (const char *)GET_QUERY_BUF, 9);
 
-  ESP_LOGI(TAG, "TVOC sensor set to stop mode");
-}
-
-bool tvoc_get_active_device_data(uint16_t *i_air_quality,
-                                uint16_t *i_eco2,
-                                uint16_t *i_ch2o,
-                                float *i_tvoc)
-{
-  size_t buffer_length = 0;
-  ESP_ERROR_CHECK(uart_get_buffered_data_len(TVOC_UART, &buffer_length));
-
-  if (buffer_length < sizeof(rx_buf))
+  int len = uart_read_bytes(TVOC_UART, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(200));
+  if (len != (int)sizeof(rx_buf))
   {
-    // Not enough data received yet
-    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGD(TAG, "TVOC query: short/no response (%d bytes)", len);
     return false;
   }
 
-  int len = uart_read_bytes(TVOC_UART, rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(10));
-  if (len < 0)
+  // header (FE FE 68) and footer (0x16)
+  if (rx_buf[0] != 0xFE || rx_buf[1] != 0xFE || rx_buf[2] != 0x68 || rx_buf[sizeof(rx_buf) - 1] != 0x16)
   {
-    ESP_LOGE(TAG, "Failed to read from TVOC sensor");
+    ESP_LOGD(TAG, "TVOC query: bad framing, flushing to resync");
     uart_flush(TVOC_UART);
     return false;
   }
 
-  // check header (0xFE) and footer (0x16)
-  if (rx_buf[0] != 0xFE || rx_buf[sizeof(rx_buf) - 1] != 0x16)
+  // checksum over bytes 3..8 (stored in byte 9)
+  if (CRC_Check(rx_buf, 6) != rx_buf[9])
   {
-    // Expected on startup: we can begin reading mid-frame, so the first read is
-    // misaligned. Flushing drops the stale bytes and the next read resyncs to a
-    // frame boundary. Log at debug -- it's transient and self-correcting.
-    ESP_LOGD(TAG, "Misaligned TVOC frame, flushing to resync");
-    uart_flush(TVOC_UART);
+    ESP_LOGD(TAG, "TVOC query: CRC error");
     return false;
   }
 
-  // crc check
-  uint8_t crc = CRC_Check(rx_buf, 6);
-  if (crc != rx_buf[9])
-  {
-    ESP_LOGE(TAG, "TVOC sensor data CRC error");
-    uart_flush(TVOC_UART);
-    return false;
-  }
-
-  // extract TVOC, CO2, and CH2O values
-  aqi = rx_buf[1];                        // Air quality index
-  eco2 = (rx_buf[3] << 8) | rx_buf[4];             // Combine two bytes to get eCO2 value
-  ch2o = (rx_buf[5] << 8) | rx_buf[6];            // Combine two bytes to get formaldehyde (CH2O) value
-  tvoc = ((rx_buf[7] << 8) | rx_buf[8]) / 1000.0; // Combine two bytes and convert to TVOC value
-
-  *i_air_quality = aqi;
-  *i_eco2 = eco2;
-  *i_ch2o = ch2o;
-  *i_tvoc = tvoc;
-
+  *adc = (rx_buf[7] << 8) | rx_buf[8];
   return true;
+}
+
+bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
+{
+  if (s_recal_pending)
+  {
+    s_recal_pending = false;
+    s_base = 0.0f;
+    s_warm_max = 0.0f;
+    s_warm_count = 0;
+    ESP_LOGI(TAG, "TVOC baseline recalibration requested");
+  }
+
+  uint16_t adc;
+  if (!tvoc_query_adc(&adc))
+  {
+    return false;
+  }
+  if (raw_adc)
+  {
+    *raw_adc = adc;
+  }
+
+  // Seed the clean-air baseline from the cleanest (highest) of the first samples.
+  if (s_warm_count < TVOC_WARM_SAMPLES)
+  {
+    if ((float)adc > s_warm_max)
+    {
+      s_warm_max = (float)adc;
+    }
+    if (++s_warm_count >= TVOC_WARM_SAMPLES)
+    {
+      s_base = s_warm_max;
+      ESP_LOGI(TAG, "TVOC baseline established: ADC0=%.0f", s_base);
+    }
+    return false; // still calibrating -- no valid reading yet
+  }
+
+  if ((float)adc > s_base)
+  {
+    s_base = (float)adc; // cleaner air seen -> raise baseline
+  }
+  else
+  {
+    s_base = s_base * 0.99995f + (float)adc * 0.00005f; // ultra-slow drift comp
+  }
+
+  float ratio = s_base / (adc > 0 ? (float)adc : 1.0f);
+  float ppm = TVOC_C * logf(ratio);
+  if (ppm < 0.0f)
+  {
+    ppm = 0.0f;
+  }
+  if (tvoc_ppb)
+  {
+    *tvoc_ppb = (uint16_t)(ppm * 1000.0f + 0.5f);
+  }
+  return true;
+}
+
+void tvoc_recalibrate(void)
+{
+  s_recal_pending = true;
 }
 
 bool tvoc_is_alarm_triggered(void)

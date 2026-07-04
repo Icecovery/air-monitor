@@ -93,11 +93,18 @@ Simple byte sum:
 
 ## Firmware notes
 
-- `tvoc_init()` configures UART1 and the RST/ALM GPIOs; `tvoc_set_device_active_mode()`
-  (re)enters active mode at boot; `tvoc_get_active_device_data()` parses the 11-byte
-  active frame (header/footer + checksum validated).
+- **This firmware ignores the module's computed values and uses query mode.** After
+  long storage the module's internal MOX baseline drifts and pins its *computed* TVOC
+  at ~0.352 ppm (and eCO2/CH2O/AQI are all derived from that same stuck baseline) —
+  see `re-report.md` for the SWD teardown. The raw ADC in the query response is still
+  fully responsive, so the firmware polls it and derives TVOC host-side.
+- `tvoc_init()` configures UART1 and the RST/ALM GPIOs; `tvoc_start()` sends the STOP
+  command to leave active upload for query mode; `tvoc_read()` sends the query command,
+  parses the 11-byte response (header `FE FE 68` / footer `0x16` + checksum validated),
+  and computes `TVOC(ppm) = C·ln(ADC0/ADC)` (C=1.86) with ADC0 the cleanest ADC seen.
+  `tvoc_recalibrate()` re-seeds ADC0 from the next few (assumed clean) samples.
 - Values are garbage during the ~2 min warm-up; the sensor simply streams what it
-  has, there is no "ready" flag.
+  has, there is no "ready" flag. `tvoc_read()` returns false until ADC0 is seeded.
 - Resources: the wiki links a datasheet (`TVOC Sensor Datasheet`), demo pack
   (`TVOC_Sensor_Demo.zip` from files.waveshare.com), and the WS-TVOC Windows test
   tool.

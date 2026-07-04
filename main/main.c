@@ -22,10 +22,13 @@ static SemaphoreHandle_t tvoc_data_mutex = NULL;
 static SemaphoreHandle_t co2_data_mutex = NULL;
 
 // Data readings
-static uint16_t g_aqi_reading = 0;
-static uint16_t g_eco2_reading = 0;
-static uint16_t g_ch2o_reading = 0;
-static uint16_t g_tvoc_reading = 0.0f;
+static uint16_t g_tvoc_reading = 0; // ppb, host-computed from the raw MOX ADC, latest instantaneous sample
+
+// Accumulator for the average TVOC reported to Zigbee each ZIGBEE_UPDATE_INTERVAL_TICKS
+// window (rather than just whichever sample happened to be latest when the timer
+// fired). Guarded by tvoc_data_mutex; reset by zigbee_update_task once consumed.
+static uint32_t g_tvoc_accum_sum = 0;
+static uint32_t g_tvoc_accum_count = 0;
 
 static float g_temperature_reading = 0.0f;
 static float g_humidity_reading = 0.0f;
@@ -34,7 +37,7 @@ static uint16_t g_co2_reading = 0;
 // Set true once each sensor has produced at least one valid reading. Until then
 // we don't push its group to Zigbee, so HA shows "unknown" rather than a fake 0.
 // Monotonic latches (false->true once), single writer each; plain volatile is safe.
-static volatile bool g_tvoc_valid = false; // TVOC sensor (AQI/eCO2/CH2O/TVOC)
+static volatile bool g_tvoc_valid = false; // TVOC sensor
 static volatile bool g_co2_valid = false;  // SCD41 (CO2/temperature/humidity)
 
 static void tvoc_task(void *pvParameters)
@@ -43,44 +46,32 @@ static void tvoc_task(void *pvParameters)
   tvoc_init();
 
   vTaskDelay(pdMS_TO_TICKS(500)); // let the sensor finish booting before commanding it
-  tvoc_set_device_active_mode();
+  tvoc_start();                   // put the sensor into query mode (raw-ADC polling)
+  vTaskDelay(pdMS_TO_TICKS(500)); // let the mode switch settle before the first query
 
-  static uint16_t aqi = 0;
-  static uint16_t eco2 = 400; // default
-  static uint16_t ch2o = 0;
-  static float tvoc = 0.0f;
+  // Let the MOX element warm up (~120 s) before reading, so the clean-air baseline
+  // is seeded from warmed-up air rather than garbage. Stays "unknown" in HA until then.
+  ESP_LOGI(TASK_TAG, "TVOC warm-up: waiting %d s before first reading", (int)(TVOC_WARMUP_TICKS / configTICK_RATE_HZ));
+  vTaskDelay(TVOC_WARMUP_TICKS);
+  ESP_LOGI(TASK_TAG, "TVOC warm-up complete; starting readings");
+
   static uint16_t tvoc_ppb = 0;
-
-  static uint32_t iterationSinceLastUpdate = 0;
+  static uint16_t raw_adc = 0;
 
   while (true)
   {
-    if (tvoc_get_active_device_data(&aqi, &eco2, &ch2o, &tvoc))
+    // Poll the raw MOX ADC and derive TVOC host-side (the module's own computed
+    // value is stuck -- see docs/re-report.md). tvoc_read returns false while the
+    // clean-air baseline is still being established, so the group stays "unknown".
+    if (tvoc_read(&tvoc_ppb, &raw_adc))
     {
-      iterationSinceLastUpdate = 0;
+      g_tvoc_valid = true; // we now have real data (even if the value is zero)
 
-      // During warm-up (~120 s) the sensor streams frames with air level 0 (an
-      // invalid AQI -- real levels are 1-4). Ignore those so we never report a
-      // fake reading: only a real frame marks the group valid and updates globals.
-      if (aqi == 0)
+      if (tvoc_ppb != g_tvoc_reading)
       {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        continue;
-      }
-
-      g_tvoc_valid = true; // we now have real data (even if a value is zero)
-
-      tvoc_ppb = (uint16_t)(tvoc * 1000.0f); // Convert TVOC to ppb
-
-      if (aqi != g_aqi_reading || eco2 != g_eco2_reading || ch2o != g_ch2o_reading || tvoc_ppb != g_tvoc_reading)
-      {
-        ESP_LOGI(TASK_TAG, "TVOC sensor data - AQI: %d, eCO2: %d ppm, CH2O: %d ppb, TVOC: %d ppb",
-                 aqi, eco2, ch2o, tvoc_ppb);
+        ESP_LOGI(TASK_TAG, "TVOC: %d ppb (raw ADC %d)", tvoc_ppb, raw_adc);
         if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
         {
-          g_aqi_reading = aqi;
-          g_eco2_reading = eco2;
-          g_ch2o_reading = ch2o;
           g_tvoc_reading = tvoc_ppb;
           xSemaphoreGive(tvoc_data_mutex);
         }
@@ -89,22 +80,9 @@ static void tvoc_task(void *pvParameters)
           ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex");
         }
       }
-      else {
-        // ESP_LOGI(TASK_TAG, "data unchanged");
-      }
-      vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    else {
-      iterationSinceLastUpdate++;
-      // No stream arriving. The sensor persists its mode across boots, so it may
-      // be stuck in query mode (e.g. left there by a debug session). Re-issue the
-      // active-mode command periodically to recover. ~every 5 s (50 * 100 ms).
-      if (iterationSinceLastUpdate % 50 == 0)
-      {
-        ESP_LOGW(TASK_TAG, "No TVOC stream; re-sending active-mode command");
-        tvoc_set_device_active_mode();
-      }
-    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000)); // 1 Hz, matching the sensor's refresh rate
   }
 }
 
@@ -310,15 +288,12 @@ static void display_update_task(void *pvParameters)
     vTaskDelay(DISPLAY_UPDATE_INTERVAL_TICKS);
 
     // Take mutexes to read shared data
-    uint16_t aqi = 0, eco2 = 0, co2 = 0, ch2o = 0, tvoc = 0;
+    uint16_t co2 = 0, tvoc = 0;
     float temperature = 0.0f, humidity = 0.0f;
 
     if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
-      aqi = g_aqi_reading;
-      ch2o = g_ch2o_reading;
       tvoc = g_tvoc_reading;
-      eco2 = g_eco2_reading;
       xSemaphoreGive(tvoc_data_mutex);
     }
     else
@@ -339,7 +314,7 @@ static void display_update_task(void *pvParameters)
     }
 
     status_led_solid(STATUS_LED_DIM_BLUE);
-    epaper_display(aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
+    epaper_display(co2, tvoc, temperature, humidity);
     status_led_off();
   }
 }
@@ -353,10 +328,10 @@ static void zigbee_update_task(void *pvParameters)
   // out, even if it happens to be zero. Each group is only sent once its sensor
   // has real data (g_*_valid) and the values changed -- so HA shows "unknown"
   // (not 0) before data, then updates on every genuine change.
-  uint16_t aqi = 0, eco2 = 0, ch2o = 0, tvoc = 0;
+  uint16_t tvoc = 0;
   uint16_t co2 = 0;
   float temperature = 0.0f, humidity = 0.0f;
-  bool air_quality_reported = false;
+  bool tvoc_reported = false;
   bool climate_reported = false;
 
   while (true)
@@ -364,18 +339,13 @@ static void zigbee_update_task(void *pvParameters)
     // Update Zigbee every 15 seconds
     vTaskDelay(ZIGBEE_UPDATE_INTERVAL_TICKS);
 
-    // --- Air quality group (TVOC sensor: AQI / eCO2 / CH2O / TVOC) ---
-    bool air_quality_changed = false;
+    // --- TVOC (host-computed from the raw MOX ADC) ---
+    bool tvoc_changed = false;
     if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
-      if (g_tvoc_valid &&
-          (!air_quality_reported || aqi != g_aqi_reading || eco2 != g_eco2_reading ||
-           ch2o != g_ch2o_reading || tvoc != g_tvoc_reading))
+      if (g_tvoc_valid && (!tvoc_reported || tvoc != g_tvoc_reading))
       {
-        air_quality_changed = true;
-        aqi = g_aqi_reading;
-        eco2 = g_eco2_reading;
-        ch2o = g_ch2o_reading;
+        tvoc_changed = true;
         tvoc = g_tvoc_reading;
       }
       xSemaphoreGive(tvoc_data_mutex);
@@ -385,10 +355,10 @@ static void zigbee_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex for Zigbee update");
     }
 
-    if (air_quality_changed)
+    if (tvoc_changed)
     {
-      air_quality_reported = true;
-      zigbee_report_air_quality(aqi, eco2, ch2o, tvoc);
+      tvoc_reported = true;
+      zigbee_report_tvoc(tvoc);
     }
 
     // --- Climate group (SCD41: CO2 / temperature / humidity) ---
@@ -447,6 +417,11 @@ void app_main(void)
   xTaskCreate(scd41_task, "scd41_task", 16384, NULL, 5, NULL);
   xTaskCreate(display_update_task, "display_update_task", 16384, NULL, 5, NULL);
   xTaskCreate(zigbee_update_task, "zigbee_update_task", 8192, NULL, 5, NULL);
+
+  // HA's "Recalibrate TVOC" button re-seeds the clean-air baseline in the tvoc
+  // driver. Register before zigbee_init so the handler is set when the stack
+  // registers the custom cluster.
+  zigbee_set_recalibrate_handler(tvoc_recalibrate);
 
   zigbee_init();
 

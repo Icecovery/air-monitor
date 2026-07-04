@@ -12,6 +12,8 @@ static const char *TAG = "epaper";
 
 UBYTE *imageCache;
 char strBuffer[16];
+// Air-quality face glyphs (custom font). AQI was dropped from the sensor path, so
+// the displayed face is hard-coded for now until a replacement metric is wired up.
 const char *good = ")";
 const char *moderate = "*";
 const char *bad = "(";
@@ -67,10 +69,10 @@ void epaper_setup(void)
   DEV_Module_Exit();
 }
 
-void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, uint16_t tvoc, float temperature, float humidity)
+void epaper_display(uint16_t co2, uint16_t tvoc, float temperature, float humidity)
 {
-  ESP_LOGI(TAG, "epaper_display called with parameters - AQI: %d, eCO2: %d ppm, CO2: %d ppm, CH2O: %d ppb, TVOC: %d ppb, Temp: %.3f C, Humidity: %.3f%%",
-           aqi, eco2, co2, ch2o, tvoc, temperature, humidity);
+  ESP_LOGI(TAG, "epaper_display called with parameters - CO2: %d ppm, TVOC: %d ppb, Temp: %.3f C, Humidity: %.3f%%",
+           co2, tvoc, temperature, humidity);
 
   ESP_LOGI(TAG, "Wake up and init EPD_2IN15G");
   DEV_Module_Init();
@@ -117,27 +119,12 @@ void epaper_display(uint16_t aqi, uint16_t eco2, uint16_t co2, uint16_t ch2o, ui
   Paint_DrawString_LUT(164, 65, strBuffer, &RecMono40Numbers, tvoc <= 660 ? EPD_2IN15G_BLACK : EPD_2IN15G_YELLOW, tvoc <= 660 ? EPD_2IN15G_WHITE : EPD_2IN15G_RED);
 
   // === third row ===
-
-  snprintf(strBuffer, sizeof(strBuffer), "%d", eco2);
-  Paint_DrawString_LUT(4, 128, strBuffer, &RecMono36, eco2 <= 1000 ? EPD_2IN15G_BLACK : EPD_2IN15G_RED, EPD_2IN15G_WHITE);
-  Paint_DrawString_EN(4, 118, "eCO2 PPM", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
-
-  snprintf(strBuffer, sizeof(strBuffer), "%d", ch2o);
-  Paint_DrawString_LUT(120, 128, strBuffer, &RecMono36, ch2o <= 40 ? EPD_2IN15G_BLACK : EPD_2IN15G_RED, EPD_2IN15G_WHITE);
-  Paint_DrawString_EN(120, 118, "CH2O PPB", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
-
-  snprintf(
-    strBuffer, 
-    sizeof(strBuffer), 
-    "%d %s", 
-    aqi, 
-    aqi <= 1 
-      ? good 
-      : aqi <= 3 
-        ? moderate
-        : bad
-  );
-  Paint_DrawString_LUT(235, 128, strBuffer, &RecMono36, aqi <= 3 ? EPD_2IN15G_BLACK : EPD_2IN15G_RED, EPD_2IN15G_WHITE);
+  // eCO2/CH2O/AQI were removed (the module can't compute them reliably -- see
+  // docs/re-report.md). The eCO2/CH2O spots are left blank pending a layout rework;
+  // the air-quality face is kept but hard-coded for now.
+  const char *aqi_symbol = good; // placeholder until a real metric drives this
+  snprintf(strBuffer, sizeof(strBuffer), "%s", aqi_symbol);
+  Paint_DrawString_LUT(235, 128, strBuffer, &RecMono36, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
   Paint_DrawString_EN(235, 118, "AQI", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
 
   // === Dividers ===

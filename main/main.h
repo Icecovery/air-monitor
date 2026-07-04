@@ -10,6 +10,11 @@
 #define DISPLAY_UPDATE_INTERVAL_TICKS pdMS_TO_TICKS(600000) // 10 minutes
 #define ZIGBEE_UPDATE_INTERVAL_TICKS pdMS_TO_TICKS(15000) // 15 seconds
 
+// TVOC sensor warm-up: the MOX element needs ~120 s after power-on before its
+// readings are meaningful (datasheet). We wait this out before the first ADC read
+// so the clean-air baseline (ADC0) is seeded from warmed-up air, not garbage.
+#define TVOC_WARMUP_TICKS pdMS_TO_TICKS(120000) // 120 seconds
+
 #define FLOAT_NEQ(a, b) (fabsf((a) - (b)) > 0.01f)
 
 #define SCD41_TEMP_OFFSET 10.8f // degree Celsius

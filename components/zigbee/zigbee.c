@@ -1,9 +1,14 @@
 #include "zigbee.h"
 
 #include <math.h>
+#include <string.h>
+#include <time.h>
+#include <sys/time.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_system.h"
@@ -19,6 +24,8 @@
 #include "ezbee/zcl/cluster/rel_humidity_measurement_desc.h"
 #include "ezbee/zcl/cluster/carbon_dioxide_measurement_desc.h"
 #include "ezbee/zcl/cluster/analog_input_desc.h"
+#include "ezbee/zcl/cluster/analog_output_desc.h"
+#include "ezbee/zcl/cluster/time_desc.h"
 #include "ezbee/zcl/cluster/custom.h"
 #include "ezbee/zdo/zdo_dev_srv_disc.h"
 
@@ -53,6 +60,22 @@ static const char *TAG = "zigbee";
 #define RECAL_CLUSTER_ID 0xFC10 // manufacturer-specific (avoid 0xFC00, squatted)
 #define RECAL_ATTR_ID    0x0000
 
+// Same write-only idiom for the "Force refresh display" button.
+#define DISPLAY_REFRESH_CLUSTER_ID 0xFC11
+#define DISPLAY_REFRESH_ATTR_ID    0x0000
+
+#define EU_NONE 0 // skip the AnalogOutput EngineeringUnits attribute
+
+// Real-world time is pulled from the coordinator's Time cluster (server), which
+// ZHA/zigpy exposes on endpoint 1 of nwk address 0x0000. We read LocalTime (0x0007)
+// -- already adjusted for the HA host's timezone + DST -- with a direct Read
+// Attributes (ZHA doesn't answer the discovery-based synchronize handshake).
+#define COORDINATOR_NWK_ADDR 0x0000
+#define COORDINATOR_TIME_EP  1
+// Seconds between the Unix epoch (1970-01-01, ESP-IDF's clock) and the Zigbee epoch
+// (2000-01-01, all ZCL time attributes). Add to a ZCL time to get a time_t.
+#define ZIGBEE_TO_UNIX_EPOCH 946684800UL
+
 /* Static function declarations */
 static void zigbee_task(void *pvParameters);
 static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal);
@@ -73,6 +96,13 @@ static void diagnostic_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_i
 static void recalibrate_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id);
 static void recal_cluster_init(uint8_t ep_id);
 static void recal_write_attr_cb(uint8_t ep_id, uint16_t attr_id, void *new_value, uint16_t manuf_code);
+static void display_refresh_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id);
+static void display_refresh_cluster_init(uint8_t ep_id);
+static void display_refresh_write_attr_cb(uint8_t ep_id, uint16_t attr_id, void *new_value, uint16_t manuf_code);
+static void add_number_ep(ezb_af_device_desc_t dev, uint8_t endpoint_id, float value,
+                          float min, float max, float step, uint16_t eng_units, const char *desc);
+static void send_time_read(void);
+static void handle_read_attr_rsp(ezb_zcl_cmd_read_attr_rsp_message_t *msg);
 
 static bool zigbee_initialized = false;
 static esp_timer_handle_t steering_retry_timer;
@@ -84,10 +114,52 @@ static int unavail_count;                 // delivery failures in the current wi
 static int64_t unavail_window_start_us;   // start of the current failure window
 static uint32_t recovery_reboot_count;    // persisted count of self-recovery reboots
 static zigbee_recalibrate_cb_t recalibrate_cb; // TVOC-recalibrate button handler
+static zigbee_display_refresh_cb_t display_refresh_cb; // force-display-refresh button handler
+static zigbee_scd41_temp_offset_cb_t scd41_temp_offset_cb; // HA wrote the temp-offset number
+static zigbee_scd41_altitude_cb_t scd41_altitude_cb;       // HA wrote the altitude number
+static zigbee_scd41_config_resync_cb_t scd41_config_resync_cb; // re-push true SCD41 config on (re)join
+static volatile bool g_time_synced = false; // monotonic latch: have we ever pulled real time?
+static SemaphoreHandle_t s_time_sync_sem;   // given on each successful time pull (see zigbee_sync_time)
 
 void zigbee_set_recalibrate_handler(zigbee_recalibrate_cb_t cb)
 {
   recalibrate_cb = cb;
+}
+
+void zigbee_set_display_refresh_handler(zigbee_display_refresh_cb_t cb)
+{
+  display_refresh_cb = cb;
+}
+
+void zigbee_set_scd41_temp_offset_handler(zigbee_scd41_temp_offset_cb_t cb)
+{
+  scd41_temp_offset_cb = cb;
+}
+
+void zigbee_set_scd41_altitude_handler(zigbee_scd41_altitude_cb_t cb)
+{
+  scd41_altitude_cb = cb;
+}
+
+void zigbee_set_scd41_config_resync_handler(zigbee_scd41_config_resync_cb_t cb)
+{
+  scd41_config_resync_cb = cb;
+}
+
+bool zigbee_time_is_synced(void)
+{
+  return g_time_synced;
+}
+
+bool zigbee_sync_time(uint32_t timeout_ms)
+{
+  if (!zigbee_initialized || !s_time_sync_sem)
+  {
+    return false;
+  }
+  xSemaphoreTake(s_time_sync_sem, 0); // clear any stale give from a prior pull
+  send_time_read();
+  return xSemaphoreTake(s_time_sync_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
 }
 
 void zigbee_init(void)
@@ -95,6 +167,7 @@ void zigbee_init(void)
   vTaskDelay(pdMS_TO_TICKS(15000));
   ESP_LOGI(TAG, "Zigbee initializing...");
 
+  s_time_sync_sem = xSemaphoreCreateBinary();
   ESP_ERROR_CHECK(nvs_flash_init());
   xTaskCreate(zigbee_task, "zigbee_task", 8192, NULL, 5, NULL);
   ESP_LOGI(TAG, "Zigbee initialized");
@@ -174,6 +247,10 @@ static void zigbee_action_handler(ezb_zcl_core_action_callback_id_t callback_id,
     case EZB_ZCL_CORE_IDENTIFY_EFFECT_CB_ID:
       zigbee_identify_handler((ezb_zcl_identify_effect_message_t *)message);
       break;
+    case EZB_ZCL_CORE_READ_ATTR_RSP_CB_ID:
+      // The coordinator's answer to our Time-cluster LocalTime read (see send_time_read).
+      handle_read_attr_rsp((ezb_zcl_cmd_read_attr_rsp_message_t *)message);
+      break;
     case EZB_ZCL_CORE_DEFAULT_RSP_CB_ID:
     {
       // Coordinator ACK to one of our commands. We disable it for reports (the
@@ -207,6 +284,29 @@ static void zigbee_set_attribute_handler(const ezb_zcl_set_attr_value_message_t 
     // flash the LED in white to indicate identify command (non-blocking;
     // the identify_time write repeats each countdown second, one burst per write)
     status_led_blink(STATUS_LED_WHITE, 3, 100, 100);
+    return;
+  }
+
+  // HA's number entities (SCD41 temp offset / altitude) write AnalogOutput's
+  // present_value. Checking cluster_id (not just dst_ep) avoids any ambiguity with
+  // AnalogInput's numerically identical attribute ID (0x0055).
+  if (message->info.cluster_id == EZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT &&
+      message->in.attribute.id == EZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID)
+  {
+    float v = *(float *)message->in.attribute.data.value;
+    switch (message->info.dst_ep)
+    {
+      case SCD41_TEMP_OFFSET_ENDPOINT:
+        ESP_LOGI(TAG, "HA set SCD41 temp offset: %.2f", v);
+        if (scd41_temp_offset_cb) { scd41_temp_offset_cb(v); }
+        break;
+      case SCD41_ALTITUDE_ENDPOINT:
+        ESP_LOGI(TAG, "HA set SCD41 altitude: %.0f", v);
+        if (scd41_altitude_cb) { scd41_altitude_cb((uint16_t)v); }
+        break;
+      default:
+        break;
+    }
   }
 }
 
@@ -235,6 +335,16 @@ static esp_err_t device_create(void)
 
   /* "Recalibrate TVOC" button (write-only custom cluster; quirk renders a button) */
   recalibrate_endpoint_add(dev, TVOC_RECALIBRATE_ENDPOINT);
+
+  /* "Force refresh display" button (same idiom as the recalibrate button above) */
+  display_refresh_endpoint_add(dev, DISPLAY_REFRESH_ENDPOINT);
+
+  /* SCD41 calibration: native HA "number" entities (AnalogOutput). Seeded with
+   * placeholders here (device_create runs before any I2C activity) -- the true
+   * values are pushed shortly after via zigbee_report_scd41_config(), see scd41_task
+   * and the (re)join handlers above. */
+  add_number_ep(dev, SCD41_TEMP_OFFSET_ENDPOINT, 0.0f, 0.0f, 20.0f, 0.1f, EU_NONE, "\x11""SCD41 temp offset");
+  add_number_ep(dev, SCD41_ALTITUDE_ENDPOINT, 0.0f, 0.0f, 3000.0f, 10.0f, EU_NONE, "\x0e""SCD41 altitude");
 
   ESP_ERROR_CHECK(ezb_af_device_desc_register(dev));
   return ESP_OK;
@@ -283,6 +393,13 @@ static void main_endpoint_add(ezb_af_device_desc_t dev)
   };
   ezb_zcl_cluster_desc_t co2 = ezb_zcl_carbon_dioxide_measurement_create_cluster_desc(&co2_cfg, EZB_ZCL_CLUSTER_SERVER);
 
+  /* Time cluster (CLIENT role). We don't serve time -- we read LocalTime from the
+   * coordinator's Time *server* (see send_time_read). A Read Attributes is a
+   * client->server command, so the Time cluster must be present on THIS endpoint in
+   * client role or the stack rejects the send with EZB_ERR_NOT_FOUND (0x5). Client
+   * role needs no config (mirrors the thermostat example reading a remote sensor). */
+  ezb_zcl_cluster_desc_t time_cluster = ezb_zcl_time_create_cluster_desc(NULL, EZB_ZCL_CLUSTER_CLIENT);
+
   ezb_af_ep_config_t ep_cfg = {
     .ep_id = BASIC_ENDPOINT,
     .app_profile_id = EZB_AF_HA_PROFILE_ID,
@@ -295,6 +412,7 @@ static void main_endpoint_add(ezb_af_device_desc_t dev)
   ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, temperature));
   ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, humidity));
   ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, co2));
+  ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, time_cluster));
   ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
 }
 
@@ -405,6 +523,159 @@ static void recalibrate_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_
   ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
 }
 
+/* Write-only momentary "button" endpoint for forcing an immediate display refresh
+ * (exact same idiom as recalibrate_endpoint_add above). */
+static void display_refresh_write_attr_cb(uint8_t ep_id, uint16_t attr_id, void *new_value, uint16_t manuf_code)
+{
+  (void)attr_id;
+  (void)new_value;
+  (void)manuf_code;
+  ESP_LOGW(TAG, "Force-refresh-display button pressed (ep %u)", ep_id);
+  if (display_refresh_cb)
+  {
+    display_refresh_cb();
+  }
+}
+
+static void display_refresh_cluster_init(uint8_t ep_id)
+{
+  (void)ep_id;
+  ezb_zcl_custom_cluster_handlers_t handlers = {
+    .cluster_id = DISPLAY_REFRESH_CLUSTER_ID,
+    .cluster_role = EZB_ZCL_CLUSTER_SERVER,
+    .write_attr_cb = display_refresh_write_attr_cb,
+  };
+  ezb_zcl_custom_cluster_handlers_register(&handlers);
+}
+
+static void display_refresh_endpoint_add(ezb_af_device_desc_t dev, uint8_t endpoint_id)
+{
+  ezb_zcl_custom_cluster_config_t refresh_cfg = {
+    .cluster_id = DISPLAY_REFRESH_CLUSTER_ID,
+    .init_func = display_refresh_cluster_init,
+    .deinit_func = NULL,
+  };
+  ezb_zcl_cluster_desc_t refresh = ezb_zcl_custom_create_cluster_desc(&refresh_cfg, EZB_ZCL_CLUSTER_SERVER);
+  uint8_t refresh_val = 0;
+  ESP_ERROR_CHECK(ezb_zcl_custom_cluster_desc_add_attr(refresh, DISPLAY_REFRESH_ATTR_ID, EZB_ZCL_ATTR_TYPE_UINT8,
+                                                       EZB_ZCL_ATTR_ACCESS_READ_WRITE, &refresh_val));
+
+  ezb_af_ep_config_t ep_cfg = {
+    .ep_id = endpoint_id,
+    .app_profile_id = EZB_AF_HA_PROFILE_ID,
+    .app_device_id = EZB_ZHA_SIMPLE_SENSOR_DEVICE_ID,
+    .app_device_version = 0,
+  };
+  ezb_af_ep_desc_t ep = ezb_af_create_endpoint_desc(&ep_cfg);
+  ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, refresh));
+  ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
+}
+
+/* One AnalogOutput endpoint = one native HA "number" entity (ZHA maps AnalogOutput
+ * -> number directly, no zhaquirk.py entry needed -- see the presence-sensor sibling
+ * repo's add_number_ep, which this mirrors). @p step also sets the Resolution
+ * attribute, which drives ZHA's slider-vs-textbox rendering (slider only if
+ * (max-min)/step <= 256). @p desc is a length-prefixed ZCL string. */
+static void add_number_ep(ezb_af_device_desc_t dev, uint8_t endpoint_id, float value,
+                          float min, float max, float step, uint16_t eng_units, const char *desc)
+{
+  ezb_zcl_analog_output_cluster_server_config_t cfg = {
+    .out_of_service = false,
+    .present_value = value,
+    .status_flags = 0,
+  };
+  ezb_zcl_cluster_desc_t ao = ezb_zcl_analog_output_create_cluster_desc(&cfg, EZB_ZCL_CLUSTER_SERVER);
+  float resolution = step;
+  ESP_ERROR_CHECK(ezb_zcl_analog_output_cluster_desc_add_attr(ao, EZB_ZCL_ATTR_ANALOG_OUTPUT_MIN_PRESENT_VALUE_ID, &min));
+  ESP_ERROR_CHECK(ezb_zcl_analog_output_cluster_desc_add_attr(ao, EZB_ZCL_ATTR_ANALOG_OUTPUT_MAX_PRESENT_VALUE_ID, &max));
+  ESP_ERROR_CHECK(ezb_zcl_analog_output_cluster_desc_add_attr(ao, EZB_ZCL_ATTR_ANALOG_OUTPUT_RESOLUTION_ID, &resolution));
+  if (eng_units != EU_NONE)
+  {
+    ESP_ERROR_CHECK(ezb_zcl_analog_output_cluster_desc_add_attr(ao, EZB_ZCL_ATTR_ANALOG_OUTPUT_ENGINEERING_UNITS_ID, &eng_units));
+  }
+  if (desc)
+  {
+    ESP_ERROR_CHECK(ezb_zcl_analog_output_cluster_desc_add_attr(ao, EZB_ZCL_ATTR_ANALOG_OUTPUT_DESCRIPTION_ID, (void *)desc));
+  }
+
+  ezb_af_ep_config_t ep_cfg = {
+    .ep_id = endpoint_id,
+    .app_profile_id = EZB_AF_HA_PROFILE_ID,
+    .app_device_id = EZB_ZHA_SIMPLE_SENSOR_DEVICE_ID,
+    .app_device_version = 0,
+  };
+  ezb_af_ep_desc_t ep = ezb_af_create_endpoint_desc(&ep_cfg);
+  ESP_ERROR_CHECK(ezb_af_endpoint_add_cluster_desc(ep, ao));
+  ESP_ERROR_CHECK(ezb_af_device_add_endpoint_desc(dev, ep));
+}
+
+/* --- Real-world time (Zigbee Time cluster) ---------------------------------- */
+
+/* We pull real time from the coordinator rather than keeping our own clock: ZHA/
+ * zigpy exposes a Time cluster server on endpoint 1 of nwk 0x0000 that answers a
+ * direct Read Attributes. We read LocalTime (0x0007) -- already adjusted for the HA
+ * host's timezone and DST -- and store it into the ESP-IDF system clock, so time()/
+ * gmtime_r everywhere else (the e-paper "Updated at" field) yields local wall-clock
+ * time with no manual offset. The discovery-based ezb_zcl_time_server_synchronize_
+ * time() is NOT used: ZHA doesn't answer that handshake (it timed out with 0x7). */
+
+/* Send a Read Attributes for the coordinator's LocalTime. Acquires the stack lock
+ * (callers -- join handler, display task -- do not hold it). The response arrives at
+ * EZB_ZCL_CORE_READ_ATTR_RSP_CB_ID (see handle_read_attr_rsp). */
+static void send_time_read(void)
+{
+  if (!ezb_bdb_dev_joined())
+  {
+    return; // not on a network yet; nothing to read from
+  }
+  uint16_t attr_id = EZB_ZCL_ATTR_TIME_LOCAL_TIME_ID;
+  ezb_zcl_read_attr_cmd_t cmd = {
+    .cmd_ctrl = {
+      .dst_addr = EZB_ADDRESS_SHORT(COORDINATOR_NWK_ADDR),
+      .dst_ep = COORDINATOR_TIME_EP,
+      .src_ep = BASIC_ENDPOINT,
+      .cluster_id = EZB_ZCL_CLUSTER_ID_TIME,
+      .manuf_code = EZB_ZCL_STD_MANUF_CODE,
+      .fc.direction = EZB_ZCL_CMD_DIRECTION_TO_SRV,
+    },
+    .payload = { .attr_number = 1, .attr_field = &attr_id },
+  };
+  esp_zigbee_lock_acquire(portMAX_DELAY);
+  ezb_err_t err = ezb_zcl_read_attr_cmd_req(&cmd);
+  esp_zigbee_lock_release();
+  if (err != EZB_ERR_NONE)
+  {
+    ESP_LOGW(TAG, "Time read request failed to send (0x%x)", err);
+  }
+}
+
+/* Handle the coordinator's Read Attributes response to our LocalTime request: set
+ * the system clock to local wall-clock time (Zigbee epoch -> Unix epoch), latch
+ * g_time_synced, and wake any display refresh waiting in zigbee_sync_time(). */
+static void handle_read_attr_rsp(ezb_zcl_cmd_read_attr_rsp_message_t *msg)
+{
+  for (ezb_zcl_read_attr_rsp_variable_t *v = msg->in.variables; v != NULL; v = v->next)
+  {
+    if (v->attr_id != EZB_ZCL_ATTR_TIME_LOCAL_TIME_ID ||
+        v->status != EZB_ZCL_STATUS_SUCCESS || v->attr_value == NULL)
+    {
+      continue;
+    }
+    uint32_t local_zb;
+    memcpy(&local_zb, v->attr_value, sizeof(local_zb));
+    if (local_zb == EZB_ZCL_TIME_LOCAL_TIME_DEFAULT_VALUE)
+    {
+      ESP_LOGW(TAG, "Coordinator LocalTime is unset (0xffffffff)");
+      continue;
+    }
+    struct timeval tv = { .tv_sec = (time_t)local_zb + ZIGBEE_TO_UNIX_EPOCH, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    g_time_synced = true;
+    ESP_LOGI(TAG, "Time pulled from coordinator: local_time=%" PRIu32, local_zb);
+    if (s_time_sync_sem != NULL) { xSemaphoreGive(s_time_sync_sem); }
+  }
+}
+
 /**
  * @brief Zigbee stack application signal handler (registered via ezb_app_signal_add_handler).
  */
@@ -435,6 +706,8 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
         unavail_count = 0;
         probe_fail_count = 0;
         report_health();
+        send_time_read();
+        if (scd41_config_resync_cb) { scd41_config_resync_cb(); }
       }
     }
     else
@@ -458,6 +731,8 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
       unavail_count = 0;
       probe_fail_count = 0;
       report_health();
+      send_time_read();
+      if (scd41_config_resync_cb) { scd41_config_resync_cb(); }
     }
     else
     {
@@ -732,5 +1007,36 @@ void zigbee_report_tvoc(uint16_t tvoc)
   /* Stack calls from outside the Zigbee mainloop task must hold the stack lock */
   esp_zigbee_lock_acquire(portMAX_DELAY);
   report_analog_input(TVOC_ENDPOINT, (float)tvoc);
+  esp_zigbee_lock_release();
+}
+
+/* Set + report one AnalogOutput present_value (float32). Caller holds the lock. */
+static void report_analog_output(uint8_t ep, float value)
+{
+  ezb_zcl_set_attr_value(ep, EZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, EZB_ZCL_CLUSTER_SERVER,
+                         EZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, EZB_ZCL_STD_MANUF_CODE, &value, false);
+  report_attr(ep, EZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, EZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID);
+}
+
+/**
+ * @brief Report the SCD41's actual current calibration (temp offset / altitude) on
+ * EP10/EP11, so HA's number entities reflect what the sensor is really configured
+ * with -- not just the main.h compile-time defaults device_create() seeded them
+ * with. Called by scd41_task once it resolves the sensor's boot-time config, and
+ * again on every Zigbee (re)join in case that first call raced Zigbee startup.
+ */
+void zigbee_report_scd41_config(float temp_offset_c, uint16_t altitude_m)
+{
+  if (!zigbee_initialized)
+  {
+    ESP_LOGW(TAG, "Zigbee not initialized yet, skipping SCD41 config update");
+    return;
+  }
+
+  ESP_LOGI(TAG, "Reporting SCD41 config: temp_offset=%.2f, altitude=%u", temp_offset_c, altitude_m);
+
+  esp_zigbee_lock_acquire(portMAX_DELAY);
+  report_analog_output(SCD41_TEMP_OFFSET_ENDPOINT, temp_offset_c);
+  report_analog_output(SCD41_ALTITUDE_ENDPOINT, (float)altitude_m);
   esp_zigbee_lock_release();
 }

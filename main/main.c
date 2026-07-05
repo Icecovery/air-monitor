@@ -14,12 +14,20 @@
 #include "epaper.h"
 #include <scd4x.h>
 #include "zigbee.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 static const char *TAG = "main";
+
+// App NVS (default partition; the Zigbee stack uses its own separate "zb_storage"
+// partition) for state that needs to persist across reboots.
+#define APP_NVS_NAMESPACE        "airmon"
+#define APP_NVS_KEY_SCD41_CFG_SET "scd41_cfg_set"
 
 // Mutexes for shared data
 static SemaphoreHandle_t tvoc_data_mutex = NULL;
 static SemaphoreHandle_t co2_data_mutex = NULL;
+static SemaphoreHandle_t scd41_cfg_mutex = NULL; // guards pending_scd41_cfg only
 
 // Data readings
 static uint16_t g_tvoc_reading = 0; // ppb, host-computed from the raw MOX ADC, latest instantaneous sample
@@ -39,6 +47,80 @@ static uint16_t g_co2_reading = 0;
 // Monotonic latches (false->true once), single writer each; plain volatile is safe.
 static volatile bool g_tvoc_valid = false; // TVOC sensor
 static volatile bool g_co2_valid = false;  // SCD41 (CO2/temperature/humidity)
+
+// SCD41 calibration (temp offset / altitude), HA-configurable via Zigbee "number"
+// entities (EP10/EP11). g_scd41_* mirror the sensor's true current config (under
+// co2_data_mutex); pending_scd41_cfg is a mutex-guarded inbox for HA-requested
+// changes, applied by scd41_task itself since only it may touch the sensor.
+typedef struct
+{
+  bool temp_offset_dirty;
+  float temp_offset;
+  bool altitude_dirty;
+  uint16_t altitude;
+} scd41_pending_cfg_t;
+
+static scd41_pending_cfg_t pending_scd41_cfg;
+static float g_scd41_temp_offset = SCD41_TEMP_OFFSET;
+static uint16_t g_scd41_altitude = SCD41_ALTITUDE;
+static volatile bool g_scd41_cfg_valid = false; // set once scd41_task resolves the sensor's real boot config
+
+// Task handle for display_update_task, so the "Force refresh display" Zigbee
+// button can wake it immediately (see display_refresh_requested).
+static TaskHandle_t display_task_handle = NULL;
+
+// Zigbee callback: HA wrote the SCD41 temp-offset "number" entity. Fires in Zigbee
+// stack context -- just record the pending value; scd41_task applies it.
+static void scd41_request_temp_offset(float temp_offset_c)
+{
+  if (xSemaphoreTake(scd41_cfg_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+  {
+    pending_scd41_cfg.temp_offset = temp_offset_c;
+    pending_scd41_cfg.temp_offset_dirty = true;
+    xSemaphoreGive(scd41_cfg_mutex);
+  }
+}
+
+// Zigbee callback: HA wrote the SCD41 altitude "number" entity.
+static void scd41_request_altitude(uint16_t altitude_m)
+{
+  if (xSemaphoreTake(scd41_cfg_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+  {
+    pending_scd41_cfg.altitude = altitude_m;
+    pending_scd41_cfg.altitude_dirty = true;
+    xSemaphoreGive(scd41_cfg_mutex);
+  }
+}
+
+// Zigbee callback: called on every (re)join. scd41_task may resolve the sensor's
+// true boot-time config before Zigbee is even ready to report it (its one-shot
+// call would then be silently dropped) -- this re-pushes it, mirroring how
+// report_health() already re-pushes the diagnostic values on every (re)connect.
+static void scd41_config_resync(void)
+{
+  if (!g_scd41_cfg_valid)
+  {
+    return;
+  }
+  float temp_offset;
+  uint16_t altitude;
+  if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+  {
+    temp_offset = g_scd41_temp_offset;
+    altitude = g_scd41_altitude;
+    xSemaphoreGive(co2_data_mutex);
+    zigbee_report_scd41_config(temp_offset, altitude);
+  }
+}
+
+// Zigbee callback: HA pressed the "Force refresh display" button.
+static void display_refresh_requested(void)
+{
+  if (display_task_handle)
+  {
+    xTaskNotifyGive(display_task_handle);
+  }
+}
 
 static void tvoc_task(void *pvParameters)
 {
@@ -67,18 +149,23 @@ static void tvoc_task(void *pvParameters)
     {
       g_tvoc_valid = true; // we now have real data (even if the value is zero)
 
-      if (tvoc_ppb != g_tvoc_reading)
+      // Accumulate every sample (not just on change -- an average must include
+      // unchanged samples too) for zigbee_update_task's window average, and keep
+      // g_tvoc_reading as the latest instantaneous sample for the display.
+      if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
       {
-        ESP_LOGI(TASK_TAG, "TVOC: %d ppb (raw ADC %d)", tvoc_ppb, raw_adc);
-        if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+        g_tvoc_accum_sum += tvoc_ppb;
+        g_tvoc_accum_count++;
+        if (tvoc_ppb != g_tvoc_reading)
         {
+          ESP_LOGI(TASK_TAG, "TVOC: %d ppb (raw ADC %d)", tvoc_ppb, raw_adc);
           g_tvoc_reading = tvoc_ppb;
-          xSemaphoreGive(tvoc_data_mutex);
         }
-        else
-        {
-          ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex");
-        }
+        xSemaphoreGive(tvoc_data_mutex);
+      }
+      else
+      {
+        ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex");
       }
     }
 
@@ -140,13 +227,24 @@ static void scd41_task(void *pvParameters)
 
   bool persisted_settings_dirty = false;
 
+  // Once HA has explicitly set the calibration (scd41_cfg_set persisted below), a
+  // later firmware update's SCD41_TEMP_OFFSET/SCD41_ALTITUDE defaults must never
+  // silently stomp it -- skip the factory-default comparison/overwrite entirely.
+  uint8_t scd41_cfg_set = 0;
+  nvs_handle_t cfg_nvs;
+  if (nvs_open(APP_NVS_NAMESPACE, NVS_READONLY, &cfg_nvs) == ESP_OK)
+  {
+    nvs_get_u8(cfg_nvs, APP_NVS_KEY_SCD41_CFG_SET, &scd41_cfg_set);
+    nvs_close(cfg_nvs);
+  }
+
   // set temperature offset
   float temp_offset = 0.0f;
   error = scd4x_get_temperature_offset(&dev, &temp_offset);
   HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting temperature offset", error);
   ESP_LOGI(TASK_TAG, "Current temperature offset: %.2f °C", temp_offset);
 
-  if (FLOAT_NEQ(temp_offset, SCD41_TEMP_OFFSET))
+  if (!scd41_cfg_set && FLOAT_NEQ(temp_offset, SCD41_TEMP_OFFSET))
   {
     ESP_LOGW(TASK_TAG, "Current temperature offset %.2f °C is not the expected value of %.2f °C", temp_offset, SCD41_TEMP_OFFSET);
 
@@ -154,6 +252,7 @@ static void scd41_task(void *pvParameters)
     error = scd4x_set_temperature_offset(&dev, SCD41_TEMP_OFFSET);
     HALT_IF_ERR_WITH_LED(TASK_TAG, "Error setting temperature offset", error);
     ESP_LOGI(TASK_TAG, "Set temperature offset to %.2f °C", SCD41_TEMP_OFFSET);
+    temp_offset = SCD41_TEMP_OFFSET;
 
     // persist the temperature offset
     persisted_settings_dirty = true;
@@ -167,13 +266,14 @@ static void scd41_task(void *pvParameters)
   HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting sensor altitude", error);
   ESP_LOGI(TASK_TAG, "Sensor altitude: %d m", altitude);
 
-  if (altitude != SCD41_ALTITUDE)
+  if (!scd41_cfg_set && altitude != SCD41_ALTITUDE)
   {
     ESP_LOGW(TASK_TAG, "Current sensor altitude %d m is not the expected value of %d m", altitude, SCD41_ALTITUDE);
 
     error = scd4x_set_sensor_altitude(&dev, SCD41_ALTITUDE);
     HALT_IF_ERR_WITH_LED(TASK_TAG, "Error setting sensor altitude", error);
     ESP_LOGI(TASK_TAG, "Set sensor altitude to %d m", SCD41_ALTITUDE);
+    altitude = SCD41_ALTITUDE;
 
     // persist the altitude
     persisted_settings_dirty = true;
@@ -188,6 +288,18 @@ static void scd41_task(void *pvParameters)
     HALT_IF_ERR_WITH_LED(TASK_TAG, "Error persisting settings", error);
     ESP_LOGI(TASK_TAG, "Persisted settings to non-volatile memory");
   }
+
+  // Publish the sensor's true resolved config: to the shared globals (read by
+  // scd41_config_resync on Zigbee (re)join) and, best-effort, to Zigbee right now
+  // (may be dropped if the stack isn't ready yet -- the (re)join resync covers that).
+  if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+  {
+    g_scd41_temp_offset = temp_offset;
+    g_scd41_altitude = altitude;
+    g_scd41_cfg_valid = true;
+    xSemaphoreGive(co2_data_mutex);
+  }
+  zigbee_report_scd41_config(temp_offset, altitude);
 
   // check if automatic self-calibration is enabled
   bool asc_enabled = false;
@@ -208,6 +320,77 @@ static void scd41_task(void *pvParameters)
   {
     // we sample once every 5 seconds
     vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Apply a pending HA-requested calibration change, if any. Rare path: only
+    // stop/resume periodic measurement when there's actually something to apply,
+    // since scd4x_set_temperature_offset/scd4x_set_sensor_altitude require idle mode.
+    bool apply_temp = false, apply_alt = false;
+    float new_temp_offset = 0.0f;
+    uint16_t new_altitude = 0;
+    if (xSemaphoreTake(scd41_cfg_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+    {
+      if (pending_scd41_cfg.temp_offset_dirty)
+      {
+        apply_temp = true;
+        new_temp_offset = pending_scd41_cfg.temp_offset;
+        pending_scd41_cfg.temp_offset_dirty = false;
+      }
+      if (pending_scd41_cfg.altitude_dirty)
+      {
+        apply_alt = true;
+        new_altitude = pending_scd41_cfg.altitude;
+        pending_scd41_cfg.altitude_dirty = false;
+      }
+      xSemaphoreGive(scd41_cfg_mutex);
+    }
+    if (apply_temp || apply_alt)
+    {
+      ESP_LOGI(TASK_TAG, "Applying HA-requested SCD41 config change");
+      error = scd4x_stop_periodic_measurement(&dev);
+      if (error == ESP_OK)
+      {
+        if (apply_temp)
+        {
+          error = scd4x_set_temperature_offset(&dev, new_temp_offset);
+          if (error == ESP_OK) { temp_offset = new_temp_offset; }
+          else { ESP_LOGE(TASK_TAG, "Error setting temperature offset: %i (%s)", error, esp_err_to_name(error)); }
+        }
+        if (apply_alt)
+        {
+          error = scd4x_set_sensor_altitude(&dev, new_altitude);
+          if (error == ESP_OK) { altitude = new_altitude; }
+          else { ESP_LOGE(TASK_TAG, "Error setting sensor altitude: %i (%s)", error, esp_err_to_name(error)); }
+        }
+        error = scd4x_persist_settings(&dev);
+        if (error != ESP_OK) { ESP_LOGE(TASK_TAG, "Error persisting settings: %i (%s)", error, esp_err_to_name(error)); }
+        error = scd4x_start_periodic_measurement(&dev);
+        if (error != ESP_OK) { ESP_LOGE(TASK_TAG, "Error restarting periodic measurement: %i (%s)", error, esp_err_to_name(error)); }
+
+        // Mark that HA has configured this device at least once, so a future
+        // firmware update's main.h defaults never silently override it (see the
+        // scd41_cfg_set check at boot, above).
+        nvs_handle_t cfg_nvs2;
+        if (nvs_open(APP_NVS_NAMESPACE, NVS_READWRITE, &cfg_nvs2) == ESP_OK)
+        {
+          nvs_set_u8(cfg_nvs2, APP_NVS_KEY_SCD41_CFG_SET, 1);
+          nvs_commit(cfg_nvs2);
+          nvs_close(cfg_nvs2);
+        }
+
+        if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+        {
+          g_scd41_temp_offset = temp_offset;
+          g_scd41_altitude = altitude;
+          xSemaphoreGive(co2_data_mutex);
+        }
+        zigbee_report_scd41_config(temp_offset, altitude);
+      }
+      else
+      {
+        ESP_LOGE(TASK_TAG, "Error stopping periodic measurement to apply config: %i (%s)", error, esp_err_to_name(error));
+      }
+      continue; // skip this cycle's read -- periodic measurement was just restarted, no data ready yet
+    }
 
     // check if data is ready
     error = scd4x_get_data_ready_status(&dev, &data_ready);
@@ -284,8 +467,16 @@ static void display_update_task(void *pvParameters)
 
   while (true)
   {
-    // Update display every 10 minutes
-    vTaskDelay(DISPLAY_UPDATE_INTERVAL_TICKS);
+    // Wait up to 10 minutes for the next auto-refresh, or wake immediately if the
+    // "Force refresh display" HA button fires (display_refresh_requested). Either
+    // way, re-entering this wait afterward naturally rebases the 10-minute timer.
+    ulTaskNotifyTake(pdTRUE, DISPLAY_UPDATE_INTERVAL_TICKS);
+
+    // Pull a fresh local time from the coordinator for this refresh (rather than
+    // keeping our own clock running between updates). Bounded wait for the response;
+    // on a miss the system clock keeps whatever the last successful pull set, so a
+    // brief coordinator hiccup just shows a slightly stale time, not "--/-- --:--".
+    zigbee_sync_time(3000);
 
     // Take mutexes to read shared data
     uint16_t co2 = 0, tvoc = 0;
@@ -314,7 +505,9 @@ static void display_update_task(void *pvParameters)
     }
 
     status_led_solid(STATUS_LED_DIM_BLUE);
-    epaper_display(co2, tvoc, temperature, humidity);
+    epaper_display(co2, tvoc, temperature, humidity,
+                   g_co2_valid, g_tvoc_valid,
+                   zigbee_time_is_synced());
     status_led_off();
   }
 }
@@ -339,20 +532,38 @@ static void zigbee_update_task(void *pvParameters)
     // Update Zigbee every 15 seconds
     vTaskDelay(ZIGBEE_UPDATE_INTERVAL_TICKS);
 
-    // --- TVOC (host-computed from the raw MOX ADC) ---
+    // --- TVOC (host-computed from the raw MOX ADC): report the average of every
+    // sample taken during this window, not just whichever one happened to be
+    // latest when the timer fired ---
     bool tvoc_changed = false;
+    uint32_t tvoc_sum = 0, tvoc_count = 0;
+    bool have_tvoc_samples = false;
     if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
-      if (g_tvoc_valid && (!tvoc_reported || tvoc != g_tvoc_reading))
+      if (g_tvoc_valid && g_tvoc_accum_count > 0)
       {
-        tvoc_changed = true;
-        tvoc = g_tvoc_reading;
+        tvoc_sum = g_tvoc_accum_sum;
+        tvoc_count = g_tvoc_accum_count;
+        // Only reset once actually consumed, so a mutex-take failure never drops a window.
+        g_tvoc_accum_sum = 0;
+        g_tvoc_accum_count = 0;
+        have_tvoc_samples = true;
       }
       xSemaphoreGive(tvoc_data_mutex);
     }
     else
     {
       ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex for Zigbee update");
+    }
+
+    if (have_tvoc_samples)
+    {
+      uint16_t tvoc_avg = (uint16_t)((tvoc_sum + tvoc_count / 2) / tvoc_count); // round to nearest
+      if (!tvoc_reported || tvoc_avg != tvoc)
+      {
+        tvoc_changed = true;
+        tvoc = tvoc_avg;
+      }
     }
 
     if (tvoc_changed)
@@ -393,6 +604,12 @@ void app_main(void)
 {
   ESP_LOGI(TAG, "Air Monitor starting...");
 
+  // Initialize NVS first: scd41_task (higher priority than app_main) reads its
+  // persisted "scd41_cfg_set" flag as soon as it starts, so this must happen
+  // before any xTaskCreate call below, not just inside zigbee_init() later
+  // (nvs_flash_init() is safe to call again there -- it no-ops if already done).
+  ESP_ERROR_CHECK(nvs_flash_init());
+
   // Initialize the status LED first
   esp_err_t ret = status_led_init();
   if (ret != ESP_OK)
@@ -412,16 +629,24 @@ void app_main(void)
   HALT_IF_NULL_WITH_LED(TAG, tvoc_data_mutex, "Failed to create TVOC data mutex");
   co2_data_mutex = xSemaphoreCreateMutex();
   HALT_IF_NULL_WITH_LED(TAG, co2_data_mutex, "Failed to create CO2 data mutex");
+  scd41_cfg_mutex = xSemaphoreCreateMutex();
+  HALT_IF_NULL_WITH_LED(TAG, scd41_cfg_mutex, "Failed to create SCD41 config mutex");
 
   xTaskCreate(tvoc_task, "tvoc_task", 4096, NULL, 5, NULL);
   xTaskCreate(scd41_task, "scd41_task", 16384, NULL, 5, NULL);
-  xTaskCreate(display_update_task, "display_update_task", 16384, NULL, 5, NULL);
+  xTaskCreate(display_update_task, "display_update_task", 16384, NULL, 5, &display_task_handle);
   xTaskCreate(zigbee_update_task, "zigbee_update_task", 8192, NULL, 5, NULL);
 
-  // HA's "Recalibrate TVOC" button re-seeds the clean-air baseline in the tvoc
-  // driver. Register before zigbee_init so the handler is set when the stack
-  // registers the custom cluster.
+  // Register Zigbee-driven handlers before zigbee_init so each is set when the
+  // stack registers its cluster/endpoint.
+  // HA's "Recalibrate TVOC" button re-seeds the clean-air baseline in the tvoc driver.
   zigbee_set_recalibrate_handler(tvoc_recalibrate);
+  // HA's "Force refresh display" button.
+  zigbee_set_display_refresh_handler(display_refresh_requested);
+  // HA's SCD41 temp-offset/altitude "number" entities.
+  zigbee_set_scd41_temp_offset_handler(scd41_request_temp_offset);
+  zigbee_set_scd41_altitude_handler(scd41_request_altitude);
+  zigbee_set_scd41_config_resync_handler(scd41_config_resync);
 
   zigbee_init();
 

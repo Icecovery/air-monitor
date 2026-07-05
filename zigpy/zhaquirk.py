@@ -1,16 +1,33 @@
 """Icecovery Air Quality Monitor.
 
 Endpoint layout (must match the firmware):
-  ep 1: Temperature/Humidity/CO2 (SCD41)      -> native sensors
-  ep 3: AnalogInput present_value             -> sensor (TVOC, ppb)
-  ep 6: AnalogInput present_value             -> sensor (recovery-reboot count, diag)
-  ep 7: AnalogInput present_value             -> sensor (last reset reason, diag)
-  ep 8: custom cluster 0xFC10                 -> button (recalibrate TVOC baseline)
+  ep 1:  Temperature/Humidity/CO2/Time (SCD41 + Zigbee mesh) -> native sensors
+  ep 3:  AnalogInput present_value            -> sensor (TVOC, ppb)
+  ep 6:  AnalogInput present_value            -> sensor (recovery-reboot count, diag)
+  ep 7:  AnalogInput present_value            -> sensor (last reset reason, diag)
+  ep 8:  custom cluster 0xFC10                -> button (recalibrate TVOC baseline)
+  ep 9:  custom cluster 0xFC11                -> button (force refresh display)
+  ep 10: AnalogOutput present_value           -> native number (SCD41 temp offset, C)
+  ep 11: AnalogOutput present_value           -> native number (SCD41 altitude, m)
 
 eCO2/CH2O/AQI (old EP2/4/5) were removed: the module's firmware only derives
 those from its stuck internal baseline (see docs/re-report.md), so the firmware
 no longer exposes them. TVOC stays on EP3 (host-computed from the raw MOX ADC),
-keeping its HA entity history.
+keeping its HA entity history. The old EP12 (display timezone offset) was removed
+too: the firmware now pulls already-timezone/DST-adjusted local time straight from
+the coordinator's Time cluster (LocalTime), so no manual offset is needed.
+
+EP10/11 are plain AnalogOutput clusters -- ZHA maps those to a native "number"
+entity on its own (named/ranged/united from the firmware cluster attributes), so
+this quirk doesn't declare them. It only moves them from the default "Controls"
+section into "Config" via `.change_entity_metadata(new_entity_category=...)`, which
+edits the native entity in place (no duplicate, firmware name/range/unit kept). Do
+NOT re-declare them as quirk numbers to recategorize -- a plain quirk-v2 number on
+a standard cluster does not suppress native discovery, so you'd get a duplicate.
+(change_entity_metadata needs a recent zha-device-handlers; if HA logs "QuirkBuilder
+has no attribute change_entity_metadata" the installed zhaquirks is too old and the
+numbers stay under "Controls".) The write-only custom-cluster buttons still need
+their quirk entries.
 
 Drop this file into your configured zha custom-quirks directory and re-interview
 the device after the endpoint change.
@@ -25,7 +42,7 @@ from zigpy.quirks.v2 import (
     SensorStateClass,
 )
 from zigpy.quirks.v2.homeassistant import EntityType
-from zigpy.zcl.clusters.general import AnalogInput
+from zigpy.zcl.clusters.general import AnalogInput, AnalogOutput
 from zigpy.zcl.foundation import BaseAttributeDefs, ZCLAttributeDef
 
 
@@ -40,6 +57,22 @@ class RecalibrateTvocCluster(CustomCluster):
     cluster_id = 0xFC10
     name = "Recalibrate TVOC"
     ep_attribute = "recalibrate_tvoc"
+
+    class AttributeDefs(BaseAttributeDefs):
+        trigger = ZCLAttributeDef(id=0x0000, type=t.uint8_t, access="rw")
+
+
+class DisplayRefreshCluster(CustomCluster):
+    """Manufacturer-specific cluster behind the force-display-refresh button.
+
+    Same write-only idiom as RecalibrateTvocCluster: any write to ``trigger`` makes
+    the firmware redraw the e-paper display immediately and rebase its 10-minute
+    auto-refresh timer from that moment.
+    """
+
+    cluster_id = 0xFC11
+    name = "Force Refresh Display"
+    ep_attribute = "force_refresh_display"
 
     class AttributeDefs(BaseAttributeDefs):
         trigger = ZCLAttributeDef(id=0x0000, type=t.uint8_t, access="rw")
@@ -94,6 +127,27 @@ class RecalibrateTvocCluster(CustomCluster):
         entity_type=EntityType.CONFIG,
         translation_key="recalibrate_tvoc",
         fallback_name="Recalibrate TVOC baseline",
+    )
+    # Force-refresh-display button: same write-only idiom as the recalibrate button.
+    .replaces(DisplayRefreshCluster, endpoint_id=9)
+    .write_attr_button(
+        attribute_name="trigger",
+        attribute_value=1,
+        cluster_id=DisplayRefreshCluster.cluster_id,
+        endpoint_id=9,
+        entity_type=EntityType.CONFIG,
+        translation_key="force_refresh_display",
+        fallback_name="Force refresh display",
+    )
+    # Move the natively-discovered SCD41 calibration numbers (temp offset EP10,
+    # altitude EP11) from "Controls" into "Config", in place -- see module docstring.
+    .change_entity_metadata(
+        endpoint_id=10, cluster_id=AnalogOutput.cluster_id,
+        new_entity_category=EntityType.CONFIG,
+    )
+    .change_entity_metadata(
+        endpoint_id=11, cluster_id=AnalogOutput.cluster_id,
+        new_entity_category=EntityType.CONFIG,
     )
     .add_to_registry()
 )

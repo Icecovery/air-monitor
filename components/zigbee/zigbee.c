@@ -146,6 +146,14 @@ void zigbee_set_scd41_config_resync_handler(zigbee_scd41_config_resync_cb_t cb)
   scd41_config_resync_cb = cb;
 }
 
+void zigbee_factory_reset(void)
+{
+  ESP_LOGW(TAG, "factory reset: leaving network");
+  esp_zigbee_lock_acquire(portMAX_DELAY);
+  ezb_bdb_reset_via_local_action();
+  esp_zigbee_lock_release();
+}
+
 bool zigbee_time_is_synced(void)
 {
   return g_time_synced;
@@ -281,9 +289,10 @@ static void zigbee_set_attribute_handler(const ezb_zcl_set_attr_value_message_t 
       message->in.attribute.id == EZB_ZCL_ATTR_IDENTIFY_IDENTIFY_TIME_ID)
   {
     ESP_LOGI(TAG, "Device identified");
-    // flash the LED in white to indicate identify command (non-blocking;
-    // the identify_time write repeats each countdown second, one burst per write)
-    status_led_blink(STATUS_LED_WHITE, 3, 100, 100);
+    // One white pulse per call. The stack invokes this once per countdown second,
+    // so a single pulse per call yields a clean ~1 Hz identify blink (matches the
+    // presence sensor); the prior steady state is restored after each pulse.
+    status_led_blink(STATUS_LED_WHITE, 1, 250, 250);
     return;
   }
 
@@ -315,8 +324,8 @@ static void zigbee_identify_handler(const ezb_zcl_identify_effect_message_t *mes
   ESP_LOGI(TAG, "Identify command received - effect: %d", message->in.effect_id);
   // 0 = Blink, 1 = Breathe, 2 = Okay, 3 = Channel Change, 254 = Finish, 255 = Stop
 
-  // flash the LED in white to indicate identify command (non-blocking)
-  status_led_blink(STATUS_LED_WHITE, 4, 250, 250);
+  // Same single white identify pulse as the identify_time write path above.
+  status_led_blink(STATUS_LED_WHITE, 1, 250, 250);
 }
 
 static esp_err_t device_create(void)
@@ -676,6 +685,14 @@ static void handle_read_attr_rsp(ezb_zcl_cmd_read_attr_rsp_message_t *msg)
   }
 }
 
+// Slow blue blink shown while joining / searching for a network (matches the
+// presence sensor's "joining" LED). A long burst that the next solid/off command
+// -- join success (status_led_off), a display refresh, or a fault -- supersedes.
+static void led_show_joining(void)
+{
+  status_led_blink(STATUS_LED_BLUE, 250, 200, 200);
+}
+
 /**
  * @brief Zigbee stack application signal handler (registered via ezb_app_signal_add_handler).
  */
@@ -686,6 +703,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
   {
   case EZB_ZDO_SIGNAL_SKIP_STARTUP:
     ESP_LOGI(TAG, "EZB_ZDO_SIGNAL_SKIP_STARTUP: Initialize Zigbee stack");
+    led_show_joining(); // blue while commissioning starts (superseded on join)
     ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_INITIALIZATION);
     break;
   case EZB_BDB_SIGNAL_DEVICE_FIRST_START:
@@ -698,11 +716,13 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
       if (ezb_bdb_is_factory_new())
       {
         ESP_LOGI(TAG, "Start network steering");
+        led_show_joining(); // searching for a network to join
         ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
       }
       else
       {
         ESP_LOGI(TAG, "Device rebooted, rejoined existing network");
+        status_led_off(); // connected: steady off (display refreshes flash blue)
         unavail_count = 0;
         probe_fail_count = 0;
         report_health();
@@ -728,6 +748,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
                extended_pan_id.u8[7], extended_pan_id.u8[6], extended_pan_id.u8[5], extended_pan_id.u8[4],
                extended_pan_id.u8[3], extended_pan_id.u8[2], extended_pan_id.u8[1], extended_pan_id.u8[0],
                ezb_nwk_get_panid(), ezb_nwk_get_current_channel(), ezb_nwk_get_short_address());
+      status_led_off(); // joined: steady off (display refreshes flash blue)
       unavail_count = 0;
       probe_fail_count = 0;
       report_health();
@@ -737,6 +758,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
     else
     {
       ESP_LOGI(TAG, "EZB_BDB_SIGNAL_STEERING: Network steering was not successful (status: 0x%02x)", status);
+      led_show_joining(); // still searching -- keep the blue blink alive
       esp_timer_start_once(steering_retry_timer, 1000 * 1000);
     }
     break;
@@ -758,6 +780,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
     /* Removed from the network (e.g. deleted in ZHA). Reset to factory-new and
      * reboot so the device comes back ready to pair without a manual reset. */
     ESP_LOGW(TAG, "EZB_ZDO_SIGNAL_LEAVE: Left the network; factory-resetting to re-pair");
+    status_led_blink(STATUS_LED_MAGENTA, 5, 80, 80); // factory reset (matches presence sensor)
     ezb_bdb_reset_via_local_action();               // in stack context: no lock
     esp_timer_stop(reboot_timer);
     esp_timer_start_once(reboot_timer, 2000000);    // let NVS settle, then reboot
@@ -809,6 +832,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
  */
 static void steering_retry_cb(void *arg)
 {
+  led_show_joining(); // still searching for a network
   esp_zigbee_lock_acquire(portMAX_DELAY);
   ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
   esp_zigbee_lock_release();

@@ -34,6 +34,10 @@ static float s_base = 0.0f;      // ADC0: clean-air baseline (cleanest ADC seen)
 static int s_warm_count = 0;     // samples gathered so far during (re)calibration
 static float s_warm_max = 0.0f;  // running max used to seed the baseline
 static volatile bool s_recal_pending = false;
+// True from the moment a recal request is consumed until the fresh baseline is
+// seeded (~5 s later). Lets the caller flash a "sampling / done" LED around a
+// button-triggered recalibration without pulling any LED dependency in here.
+static volatile bool s_recal_active = false;
 
 void tvoc_init(void)
 {
@@ -158,6 +162,7 @@ bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
   if (s_recal_pending)
   {
     s_recal_pending = false;
+    s_recal_active = true;
     s_base = 0.0f;
     s_warm_max = 0.0f;
     s_warm_count = 0;
@@ -174,7 +179,8 @@ bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
     *raw_adc = adc;
   }
 
-  // Seed the clean-air baseline from the cleanest (highest) of the first samples.
+  // Seed the clean-air baseline from the cleanest (highest) of the first samples,
+  // matching the ongoing "raise to any cleaner air seen" model below.
   if (s_warm_count < TVOC_WARM_SAMPLES)
   {
     if ((float)adc > s_warm_max)
@@ -184,6 +190,7 @@ bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
     if (++s_warm_count >= TVOC_WARM_SAMPLES)
     {
       s_base = s_warm_max;
+      s_recal_active = false; // fresh baseline is in place
       ESP_LOGI(TAG, "TVOC baseline established: ADC0=%.0f", s_base);
     }
     return false; // still calibrating -- no valid reading yet
@@ -214,6 +221,11 @@ bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
 void tvoc_recalibrate(void)
 {
   s_recal_pending = true;
+}
+
+bool tvoc_recal_in_progress(void)
+{
+  return s_recal_active;
 }
 
 bool tvoc_is_alarm_triggered(void)

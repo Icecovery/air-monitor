@@ -16,8 +16,18 @@
 #include "zigbee.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_system.h"
 
 static const char *TAG = "main";
+
+// Onboard BOOT button (GPIO9 on the ESP32-C6 module -- also a boot strapping pin,
+// which is fine to read as a button once the app is running). Active-low.
+//   - short press  -> force an immediate display refresh (same as HA's button)
+//   - hold >= 5 s  -> factory reset (leave the Zigbee network) + reboot
+#define BOOT_BUTTON_GPIO         GPIO_NUM_9
+#define BUTTON_POLL_MS           50
+#define BUTTON_DEBOUNCE_MS       80    // ignore sub-debounce contact blips on release
+#define BUTTON_FACTORY_RESET_MS  5000  // hold this long to factory reset
 
 // App NVS (default partition; the Zigbee stack uses its own separate "zb_storage"
 // partition) for state that needs to persist across reboots.
@@ -122,6 +132,16 @@ static void display_refresh_requested(void)
   }
 }
 
+// Zigbee callback: HA pressed the "Recalibrate TVOC" button. Flash cyan once to
+// mark that sampling has started (tvoc_task flashes cyan twice when it finishes),
+// then kick off the baseline re-seed. Runs in Zigbee stack context; status_led is
+// queue-backed so it is safe from any context.
+static void tvoc_recalibrate_requested(void)
+{
+  status_led_blink(STATUS_LED_CYAN, 1, 200, 200); // sampling started (1x)
+  tvoc_recalibrate();
+}
+
 static void tvoc_task(void *pvParameters)
 {
   static const char *TASK_TAG = "tvoc_task";
@@ -139,6 +159,8 @@ static void tvoc_task(void *pvParameters)
 
   static uint16_t tvoc_ppb = 0;
   static uint16_t raw_adc = 0;
+
+  bool recal_was_active = false; // for the recalibration "finished" LED pulse
 
   while (true)
   {
@@ -168,6 +190,17 @@ static void tvoc_task(void *pvParameters)
         ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex");
       }
     }
+
+    // Flash cyan twice on the falling edge of a button-triggered recalibration,
+    // once the fresh clean-air baseline has been seeded (matches the presence
+    // sensor's "auto-tune finished" pulse). The start pulse is fired from the
+    // button handler (tvoc_recalibrate_requested); power-on seeding never sets this.
+    bool recal_now = tvoc_recal_in_progress();
+    if (recal_was_active && !recal_now)
+    {
+      status_led_blink(STATUS_LED_CYAN, 2, 150, 150); // sampling finished (2x)
+    }
+    recal_was_active = recal_now;
 
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1 Hz, matching the sensor's refresh rate
   }
@@ -600,6 +633,55 @@ static void zigbee_update_task(void *pvParameters)
   }
 }
 
+// Polls the onboard BOOT button: a short press forces a display refresh; a >=5 s
+// hold factory-resets the Zigbee network and reboots (flashing magenta 5x, matching
+// the presence sensor's factory-reset feedback).
+static void button_task(void *pvParameters)
+{
+  const char *TASK_TAG = "button_task";
+
+  gpio_config_t io = {
+    .pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO,
+    .mode = GPIO_MODE_INPUT,
+    .pull_up_en = GPIO_PULLUP_ENABLE,
+    .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    .intr_type = GPIO_INTR_DISABLE,
+  };
+  gpio_config(&io);
+
+  int held_ms = 0;
+  bool reset_fired = false; // one factory reset per press, even if held past the threshold
+
+  while (true)
+  {
+    if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) // active-low: pressed
+    {
+      held_ms += BUTTON_POLL_MS;
+      if (held_ms >= BUTTON_FACTORY_RESET_MS && !reset_fired)
+      {
+        reset_fired = true;
+        ESP_LOGW(TASK_TAG, "BOOT held %d ms -> factory reset + reboot", held_ms);
+        status_led_blink(STATUS_LED_MAGENTA, 5, 80, 80); // factory reset (matches presence sensor)
+        zigbee_factory_reset();
+        vTaskDelay(pdMS_TO_TICKS(1000)); // let the magenta play + NVS settle, then reboot
+        esp_restart();
+      }
+    }
+    else // released
+    {
+      // Short press (released before the factory-reset threshold): force a refresh.
+      if (held_ms >= BUTTON_DEBOUNCE_MS && !reset_fired)
+      {
+        ESP_LOGI(TASK_TAG, "BOOT short press -> force display refresh");
+        display_refresh_requested();
+      }
+      held_ms = 0;
+      reset_fired = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
+  }
+}
+
 void app_main(void)
 {
   ESP_LOGI(TAG, "Air Monitor starting...");
@@ -636,11 +718,13 @@ void app_main(void)
   xTaskCreate(scd41_task, "scd41_task", 16384, NULL, 5, NULL);
   xTaskCreate(display_update_task, "display_update_task", 16384, NULL, 5, &display_task_handle);
   xTaskCreate(zigbee_update_task, "zigbee_update_task", 8192, NULL, 5, NULL);
+  xTaskCreate(button_task, "button_task", 3072, NULL, 4, NULL);
 
   // Register Zigbee-driven handlers before zigbee_init so each is set when the
   // stack registers its cluster/endpoint.
-  // HA's "Recalibrate TVOC" button re-seeds the clean-air baseline in the tvoc driver.
-  zigbee_set_recalibrate_handler(tvoc_recalibrate);
+  // HA's "Recalibrate TVOC" button re-seeds the clean-air baseline in the tvoc
+  // driver (and flashes cyan 1x start / 2x finish, see tvoc_recalibrate_requested).
+  zigbee_set_recalibrate_handler(tvoc_recalibrate_requested);
   // HA's "Force refresh display" button.
   zigbee_set_display_refresh_handler(display_refresh_requested);
   // HA's SCD41 temp-offset/altitude "number" entities.

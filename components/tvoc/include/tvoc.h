@@ -47,11 +47,20 @@ void tvoc_start(void);
 bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc);
 
 /**
- * Request a clean-air baseline recalibration. The next several samples re-seed
- * ADC0 from the current (assumed clean) air. Thread-safe: only sets a flag, so
- * it is safe to call from any context (e.g. a Zigbee stack callback).
+ * Request a clean-air baseline recalibration. The next several samples (~5 s at
+ * the caller's 1 Hz poll) re-seed ADC0 from the cleanest of the current (assumed
+ * clean) air. Thread-safe: only sets a flag, so it is safe to call from any
+ * context (e.g. a Zigbee stack callback).
  */
 void tvoc_recalibrate(void);
+
+/**
+ * @return true while a button-requested recalibration is still gathering its
+ * clean-air samples; false once the fresh baseline is seeded (and at all other
+ * times). Poll this to drive a "sampling started / finished" status indication.
+ * The initial power-on baseline seeding does NOT set this -- only tvoc_recalibrate.
+ */
+bool tvoc_recal_in_progress(void);
 
 /**
  * Check if TVOC alarm is triggered (TVOC exceeds 2ppm)

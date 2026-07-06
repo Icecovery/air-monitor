@@ -65,6 +65,11 @@ typedef void (*zigbee_scd41_config_resync_cb_t)(void);
 /* function declarations */
 void zigbee_init(void);
 
+/* Leave the network and reset to factory-new (re-pairable) state. Does NOT reboot;
+ * the caller should reboot shortly after so the stack comes back up clean. Safe to
+ * call from a plain task (acquires the Zigbee stack lock internally). */
+void zigbee_factory_reset(void);
+
 /* Register handlers. Call each before zigbee_init(). */
 void zigbee_set_recalibrate_handler(zigbee_recalibrate_cb_t cb);
 void zigbee_set_display_refresh_handler(zigbee_display_refresh_cb_t cb);

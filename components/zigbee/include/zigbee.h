@@ -27,10 +27,6 @@
 #define ESP_MANUFACTURER_NAME   "\x09""Icecovery"           /* Customized manufacturer name */
 #define ESP_MODEL_IDENTIFIER    "\x13""Air Quality Monitor" /* Customized model identifier */
 
-/* Zigbee configuration */
-// we are not battery powered, so we can afford to be a router
-#define ZIGBEE_MAX_CHILDREN 8
-
 /* NVS partition used by the Zigbee stack for its own persistent state */
 #define ZB_STORAGE_PARTITION "zb_storage"
 

@@ -34,7 +34,7 @@
 static const char *TAG = "zigbee";
 
 // --- Connectivity watchdog --------------------------------------------------
-// A mains router can silently fall off the mesh (coordinator/ZHA restart, RF drop,
+// A mains end device can silently fall off the mesh (coordinator/ZHA restart, RF drop,
 // wedged radio) while the sensor/display tasks keep running -- reports vanish and
 // commands never arrive, yet nothing reboots. Two detection layers, both recovering
 // by reboot (re-inits the radio and rejoins the saved network, the same fix a manual
@@ -183,13 +183,19 @@ void zigbee_init(void)
 
 static void zigbee_task(void *pvParameters)
 {
-  /* initialize Zigbee stack */
+  /* Join as a NON-sleepy, mains-powered END DEVICE, not a router. As a router the mesh
+   * routes other devices' traffic through us, so when this device's Zigbee stack wedges
+   * (see the connectivity watchdog below) it drops those neighbours' routes and they may
+   * fail to reconnect. An end device carries no one else's traffic, so a wedge here only
+   * affects this device (and it self-reboots). We stay always-on (rx_on_when_idle below)
+   * so HA commands have no polling latency. */
   esp_zigbee_config_t config = {
     .device_config = {
-      .device_type = EZB_NWK_DEVICE_TYPE_ROUTER,
+      .device_type = EZB_NWK_DEVICE_TYPE_END_DEVICE,
       .install_code_policy = false,
-      .zczr_config = {
-        .max_children = ZIGBEE_MAX_CHILDREN,
+      .zed_config = {
+        .ed_timeout = EZB_NWK_ED_TIMEOUT_64MIN, // parent aging timeout
+        .keep_alive = 3000,                     // keep-alive poll, ms
       },
     },
     .platform_config = {
@@ -226,6 +232,7 @@ static void zigbee_task(void *pvParameters)
   }
 
   ESP_ERROR_CHECK(esp_zigbee_init(&config));
+  ezb_set_rx_on_when_idle(true); // mains end device: keep the radio listening (no sleep, no poll latency)
   ezb_aps_secur_enable_distributed_security(false);
   ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(ZIGBEE_PRIMARY_CHANNEL_MASK));
   ESP_ERROR_CHECK(ezb_bdb_set_secondary_channel_set(ZIGBEE_PRIMARY_CHANNEL_MASK));
@@ -807,7 +814,7 @@ static bool zigbee_app_signal_handler(const ezb_app_signal_t *app_signal)
     break;
   }
   case EZB_NWK_SIGNAL_NO_ACTIVE_LINKS_LEFT:
-    /* Neighbor table aged out with no route links left: the router is isolated */
+    /* Neighbor table aged out with no route links left: the device is isolated */
     trigger_recovery("no active network links left");
     break;
   case EZB_NWK_SIGNAL_NETWORK_STATUS:

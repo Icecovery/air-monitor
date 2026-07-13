@@ -34,6 +34,15 @@ static const char *TAG = "main";
 #define APP_NVS_NAMESPACE        "airmon"
 #define APP_NVS_KEY_SCD41_CFG_SET "scd41_cfg_set"
 
+// SCD41 CO2-engine watchdog: occasionally (after days of uptime) the CO2 engine
+// wedges and reports a stuck 0 ppm while temperature/humidity (a separate sensing
+// element on the same die) keep updating normally -- atmospheric CO2 never
+// actually reads 0, so any sustained streak of exact zeros is the sensor, not the
+// air. SCD41_CO2_STUCK_ZERO_STREAK zero readings in a row (~1 min at the 5 s
+// sample cadence) triggers a soft re-init (mirrors the boot sequence); if it's
+// still stuck after another ~1 min, escalate to a full device reboot.
+#define SCD41_CO2_STUCK_ZERO_STREAK 12
+
 // Mutexes for shared data
 static SemaphoreHandle_t tvoc_data_mutex = NULL;
 static SemaphoreHandle_t co2_data_mutex = NULL;
@@ -349,6 +358,8 @@ static void scd41_task(void *pvParameters)
   static bool data_ready = false;
   static uint16_t co2;
   static float temperature, humidity;
+  static uint32_t co2_zero_streak = 0;
+  static bool co2_reinit_attempted = false;
   while (true)
   {
     // we sample once every 5 seconds
@@ -470,6 +481,41 @@ static void scd41_task(void *pvParameters)
       continue;
     }
     g_co2_valid = true; // we now have real data (even if the values are zero)
+
+    // CO2 engine watchdog -- see SCD41_CO2_STUCK_ZERO_STREAK above.
+    if (co2 == 0)
+    {
+      co2_zero_streak++;
+      if (co2_zero_streak >= SCD41_CO2_STUCK_ZERO_STREAK)
+      {
+        if (!co2_reinit_attempted)
+        {
+          ESP_LOGW(TASK_TAG, "CO2 stuck at 0 for ~1 min -- soft re-initializing SCD41");
+          error = scd4x_stop_periodic_measurement(&dev);
+          if (error == ESP_OK) { error = scd4x_reinit(&dev); }
+          if (error == ESP_OK) { error = scd4x_start_periodic_measurement(&dev); }
+          if (error != ESP_OK)
+          {
+            ESP_LOGE(TASK_TAG, "SCD41 soft re-init failed: %i (%s)", error, esp_err_to_name(error));
+          }
+          co2_reinit_attempted = true;
+          co2_zero_streak = 0; // give the re-init its own ~1 min window before condemning it
+          continue;            // no measurement ready yet right after re-init
+        }
+        else
+        {
+          ESP_LOGE(TASK_TAG, "CO2 still stuck at 0 after SCD41 soft re-init -- rebooting device");
+          status_led_solid(STATUS_LED_RED);
+          vTaskDelay(pdMS_TO_TICKS(500)); // let the log/LED settle before reset
+          esp_restart();
+        }
+      }
+    }
+    else
+    {
+      co2_zero_streak = 0;
+      co2_reinit_attempted = false;
+    }
 
     if (co2 != g_co2_reading || FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading))
     {

@@ -5,8 +5,20 @@ ESP-IDF firmware for an ESP32-C6 based **Zigbee air quality monitor**:
 - **TVOC multi-in-one sensor** (UART): AQI, eCO2, CH2O (formaldehyde), TVOC
 - **Sensirion SCD41** (I2C): CO2, temperature, humidity
 - **2.15" e-paper display** (Waveshare EPD_2in15g): local readout, refreshed every 10 minutes
-- **Zigbee router** (esp-zigbee-lib 2.x on ESP-IDF v6): reports all readings to Home Assistant / ZHA
+- **Zigbee end device** (esp-zigbee-lib 2.x on ESP-IDF v6): reports all readings to Home Assistant / ZHA
 - **WS2812 RGB LED**: status / error indication
+
+## Hardware
+
+ESP32-C6 module with 16 MB flash.
+
+| Peripheral | Interface / pins |
+|------------|------------------|
+| WS2812 RGB LED | GPIO8 (RMT via `led_strip`), RGB component order |
+| TVOC multi-in-one sensor (AQI/eCO2/CH2O/TVOC) | UART1 @115200: RX GPIO4, TX GPIO5, RST GPIO15 (ALM unconnected) |
+| SCD41 (CO2/temp/humidity) | I2C0: SDA GPIO6, SCL GPIO7 |
+| 2.15" e-paper (EPD_2in15g, red/yellow/black/white) | bit-banged SPI: MOSI 23, SCK 22, CS 21, DC 20, RST 19, BUSY 18, PWR 3 |
+| Onboard BOOT button | GPIO9 (short press: force display refresh; ≥5s hold: factory reset) |
 
 ## Layout
 

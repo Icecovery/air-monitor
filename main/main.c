@@ -652,15 +652,21 @@ static void zigbee_update_task(void *pvParameters)
     }
 
     // --- Climate group (SCD41: CO2 / temperature / humidity) ---
+    // Atmospheric CO2 never actually reads exactly 0 (see the SCD41 CO2 watchdog
+    // above) -- a bare 0 is the CO2 engine glitching, not a real reading, so it's
+    // suppressed here rather than forwarded to HA as a fake spike to 0. Temperature/
+    // humidity (a separate sensing element) still report normally in the same cycle.
     bool climate_changed = false;
     if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
+      uint16_t new_co2 = g_co2_reading;
+      bool co2_changed = (new_co2 != 0) && (!climate_reported || new_co2 != co2);
       if (g_co2_valid &&
-          (!climate_reported || co2 != g_co2_reading ||
+          (!climate_reported || co2_changed ||
            FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading)))
       {
         climate_changed = true;
-        co2 = g_co2_reading;
+        if (new_co2 != 0) { co2 = new_co2; }
         temperature = g_temperature_reading;
         humidity = g_humidity_reading;
       }

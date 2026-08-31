@@ -17,11 +17,11 @@
 
 #define FLOAT_NEQ(a, b) (fabsf((a) - (b)) > 0.01f)
 
-#define SCD41_TEMP_OFFSET 10.8f // degree Celsius
+#define SCD41_TEMP_OFFSET 2.8f // degree Celsius
 #define SCD41_ALTITUDE 70 // meter
 
 #define I2C_PORT I2C_NUM_0
-#define SDA_GPIO GPIO_NUM_6
-#define SCL_GPIO GPIO_NUM_7
+#define SDA_GPIO GPIO_NUM_0
+#define SCL_GPIO GPIO_NUM_1
 
 #endif // MAIN_H

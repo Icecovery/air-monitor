@@ -39,8 +39,10 @@ per second.
 | 5 | RST | Reset, **active low** (firmware holds it high) |
 | 6 | ALM | Alarm, **pulls low when TVOC > 2 ppm** |
 
-Wiring in this project: TXD→GPIO4 (C6 RX), RXD→GPIO5 (C6 TX), RST→GPIO15,
-ALM not connected (see `components/tvoc/include/tvoc.h`).
+Wiring in this project (ESP32-H2-Zero): sensor RXD→GPIO4 (**ESP TX**), sensor
+TXD→GPIO5 (**ESP RX**), RST→GPIO3, ALM not connected (see
+`components/tvoc/include/tvoc.h`). Note this is swapped relative to the earlier
+ESP32-C6 prototype, where TXD went to GPIO4.
 
 ## Protocol
 

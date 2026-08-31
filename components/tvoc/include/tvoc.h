@@ -6,9 +6,9 @@
 #include <stdint.h>
 
 #define TVOC_UART UART_NUM_1
-#define TVOC_RX GPIO_NUM_4
-#define TVOC_TX GPIO_NUM_5
-#define TVOC_RST GPIO_NUM_15
+#define TVOC_RX GPIO_NUM_5
+#define TVOC_TX GPIO_NUM_4
+#define TVOC_RST GPIO_NUM_3
 #define TVOC_ALM GPIO_NUM_NC
 
 #define TVOC_UART_RX_BUFFER_SIZE 256

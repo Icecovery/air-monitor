@@ -20,7 +20,7 @@
 
 static const char *TAG = "main";
 
-// Onboard BOOT button (GPIO9 on the ESP32-C6 module -- also a boot strapping pin,
+// Onboard BOOT button (GPIO9 on the ESP32-H2 module -- also a boot strapping pin,
 // which is fine to read as a button once the app is running). Active-low.
 //   - short press  -> force an immediate display refresh (same as HA's button)
 //   - hold >= 5 s  -> factory reset (leave the Zigbee network) + reboot

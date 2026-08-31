@@ -1,5 +1,5 @@
-# Board has 16 MB flash
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# Board has 4 MB flash (ESP32-H2-Zero, ESP32-H2FH4)
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # Custom partition table (adds zb_storage / zb_fct required by Zigbee)
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -13,3 +13,7 @@ CONFIG_FREERTOS_HZ=1000
 
 # Logging level
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# The ESP32-H2-Zero has no USB-UART bridge; its USB-C is the native
+# USB-Serial-JTAG peripheral (GPIO26/27), so the console must go there.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

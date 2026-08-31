@@ -23,7 +23,9 @@ typedef struct {
 #define STATUS_LED_CYAN     ((status_led_color_t){0,   255, 255})
 #define STATUS_LED_MAGENTA  ((status_led_color_t){255, 0,   255})
 #define STATUS_LED_WHITE    ((status_led_color_t){255, 255, 255})
-#define STATUS_LED_DIM_BLUE ((status_led_color_t){0,   0,   25})
+// ~5% of full brightness (global scale is 255). Only used for the brief
+// solid-blue "display refreshing" indicator.
+#define STATUS_LED_DIM_BLUE ((status_led_color_t){0,   0,   13})
 
 /**
  * Initialize the onboard status LED and start its background task.

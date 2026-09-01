@@ -78,8 +78,15 @@ void zigbee_set_scd41_config_resync_handler(zigbee_scd41_config_resync_cb_t cb);
  * then its attributes stay at their "undefined" defaults and HA shows unknown
  * rather than a fake 0. Call each only with values the sensor has actually
  * produced (a genuine 0 is fine to send). */
-void zigbee_report_climate(uint16_t co2, float temperature, float humidity); /* SCD41: EP1 */
-void zigbee_report_tvoc(uint16_t tvoc);                                       /* TVOC sensor: EP3 (ppb) */
+/* co2_valid false leaves the CO2 attribute untouched (temperature/humidity still go
+ * out), so a wedged CO2 engine reads as "unknown" in HA rather than a fake 0 ppm --
+ * see the CO2 watchdog in main.c. */
+void zigbee_report_climate(uint16_t co2, float temperature, float humidity,
+                           bool co2_valid); /* SCD41: EP1 */
+/* tvoc_valid false writes NaN -- this cluster's "undefined", the same value EP3 is
+ * created with -- so HA returns the entity to "unknown" when the sensor stops
+ * answering, instead of holding the last reading forever. */
+void zigbee_report_tvoc(uint16_t tvoc, bool tvoc_valid);                      /* TVOC sensor: EP3 (ppb) */
 void zigbee_report_scd41_config(float temp_offset_c, uint16_t altitude_m);    /* SCD41 calibration: EP10/EP11 */
 
 /* True once the coordinator has supplied a real-world time at least once (see

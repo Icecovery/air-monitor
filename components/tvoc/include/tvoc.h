@@ -43,8 +43,35 @@ void tvoc_start(void);
  * @param raw_adc   out: raw 12-bit ADC sample (may be NULL)
  * @return true if a valid reading was produced; false on a bad/absent frame or
  *         while the clean-air baseline is still being established at startup.
+ *         Use tvoc_last_query_status() to tell those two cases apart.
  */
 bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc);
+
+/**
+ * Outcome of the most recent poll attempted by tvoc_read().
+ *
+ * tvoc_read() returns false both when the sensor did not answer and while the
+ * clean-air baseline is still seeding, so a caller that wants to tell "the sensor
+ * is gone" from "still calibrating" has to look here. The per-poll detail is
+ * otherwise only logged at DEBUG, which is compiled out at this project's log
+ * level -- see the unresponsive-sensor handling in tvoc_task (main.c).
+ */
+typedef enum
+{
+  TVOC_QUERY_OK = 0,       /**< sensor answered with a well-formed frame */
+  TVOC_QUERY_NO_RESPONSE,  /**< no reply, or a short one, within the 200 ms timeout */
+  TVOC_QUERY_BAD_FRAMING,  /**< a reply arrived but its header/footer was wrong */
+  TVOC_QUERY_BAD_CHECKSUM, /**< framed correctly but the checksum did not match */
+} tvoc_query_status_t;
+
+/**
+ * @return the status of the most recent poll. TVOC_QUERY_NO_RESPONSE before the
+ * first poll has been attempted.
+ */
+tvoc_query_status_t tvoc_last_query_status(void);
+
+/** @return a human-readable form of @p status, for logging. */
+const char *tvoc_query_status_str(tvoc_query_status_t status);
 
 /**
  * Request a clean-air baseline recalibration. The next several samples (~5 s at
@@ -59,6 +86,11 @@ void tvoc_recalibrate(void);
  * clean-air samples; false once the fresh baseline is seeded (and at all other
  * times). Poll this to drive a "sampling started / finished" status indication.
  * The initial power-on baseline seeding does NOT set this -- only tvoc_recalibrate.
+ *
+ * Also returns false if the window was abandoned because the sensor stopped
+ * answering (~30 s), which restores the pre-recalibration baseline. So this always
+ * comes back false eventually, even against a dead sensor -- but a false does not
+ * by itself mean a *fresh* baseline was seeded.
  */
 bool tvoc_recal_in_progress(void);
 

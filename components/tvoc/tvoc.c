@@ -20,6 +20,11 @@ static const char *TAG = "tvoc";
 // clean-air baseline (the cleanest / highest ADC observed).
 #define TVOC_C 1.86f              // ppm per ln-unit (from the firmware curve slope)
 #define TVOC_WARM_SAMPLES 5       // clean-air samples used to seed the baseline
+// A recalibration needs TVOC_WARM_SAMPLES *answered* polls. If the sensor goes quiet
+// mid-window it would otherwise stay "in progress" forever, with the old baseline
+// already discarded -- so give up after this many attempts (~30 s at the caller's
+// 1 Hz poll) and put the previous baseline back.
+#define TVOC_RECAL_MAX_POLLS 30
 
 // Command buffers. Query mode (active upload stopped) is the only mode whose
 // response carries the raw ADC, so this firmware runs the sensor there.
@@ -38,6 +43,11 @@ static volatile bool s_recal_pending = false;
 // seeded (~5 s later). Lets the caller flash a "sampling / done" LED around a
 // button-triggered recalibration without pulling any LED dependency in here.
 static volatile bool s_recal_active = false;
+static int s_recal_attempts = 0;      // polls attempted since the recal window opened
+static float s_recal_prev_base = 0.0f; // baseline to restore if that window is abandoned
+// Outcome of the most recent poll, so the caller can tell an absent sensor from a
+// baseline that is merely still seeding (both make tvoc_read return false).
+static volatile tvoc_query_status_t s_last_query_status = TVOC_QUERY_NO_RESPONSE;
 
 void tvoc_init(void)
 {
@@ -135,6 +145,7 @@ static bool tvoc_query_adc(uint16_t *adc)
   if (len != (int)sizeof(rx_buf))
   {
     ESP_LOGD(TAG, "TVOC query: short/no response (%d bytes)", len);
+    s_last_query_status = TVOC_QUERY_NO_RESPONSE;
     return false;
   }
 
@@ -143,6 +154,7 @@ static bool tvoc_query_adc(uint16_t *adc)
   {
     ESP_LOGD(TAG, "TVOC query: bad framing, flushing to resync");
     uart_flush(TVOC_UART);
+    s_last_query_status = TVOC_QUERY_BAD_FRAMING;
     return false;
   }
 
@@ -150,11 +162,35 @@ static bool tvoc_query_adc(uint16_t *adc)
   if (CRC_Check(rx_buf, 6) != rx_buf[9])
   {
     ESP_LOGD(TAG, "TVOC query: CRC error");
+    s_last_query_status = TVOC_QUERY_BAD_CHECKSUM;
     return false;
   }
 
   *adc = (rx_buf[7] << 8) | rx_buf[8];
+  s_last_query_status = TVOC_QUERY_OK;
   return true;
+}
+
+// Abandon an in-flight recalibration whose sensor stopped answering, restoring the
+// baseline the recal discarded so a comms glitch doesn't cost a working ADC0.
+static void tvoc_recal_abort(void)
+{
+  s_recal_active = false;
+  if (s_recal_prev_base > 0.0f)
+  {
+    s_base = s_recal_prev_base;
+    s_warm_max = s_recal_prev_base;
+    s_warm_count = TVOC_WARM_SAMPLES; // resume reporting against the restored baseline
+    ESP_LOGW(TAG, "TVOC recalibration abandoned after %d unanswered polls -- restored ADC0=%.0f",
+             s_recal_attempts, s_base);
+  }
+  else
+  {
+    // Recal was requested before any baseline existed; nothing to put back, so leave
+    // the seeding state alone and let it re-seed whenever the sensor comes back.
+    ESP_LOGW(TAG, "TVOC recalibration abandoned after %d unanswered polls -- no previous baseline to restore",
+             s_recal_attempts);
+  }
 }
 
 bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
@@ -163,15 +199,28 @@ bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
   {
     s_recal_pending = false;
     s_recal_active = true;
+    // Remember what we are about to throw away, so an abandoned window (see
+    // tvoc_recal_abort) can put the working baseline back rather than leaving none.
+    s_recal_prev_base = (s_warm_count >= TVOC_WARM_SAMPLES) ? s_base : 0.0f;
+    s_recal_attempts = 0;
     s_base = 0.0f;
     s_warm_max = 0.0f;
     s_warm_count = 0;
     ESP_LOGI(TAG, "TVOC baseline recalibration requested");
   }
 
+  if (s_recal_active)
+  {
+    s_recal_attempts++;
+  }
+
   uint16_t adc;
   if (!tvoc_query_adc(&adc))
   {
+    if (s_recal_active && s_recal_attempts >= TVOC_RECAL_MAX_POLLS)
+    {
+      tvoc_recal_abort();
+    }
     return false;
   }
   if (raw_adc)
@@ -216,6 +265,23 @@ bool tvoc_read(uint16_t *tvoc_ppb, uint16_t *raw_adc)
     *tvoc_ppb = (uint16_t)(ppm * 1000.0f + 0.5f);
   }
   return true;
+}
+
+tvoc_query_status_t tvoc_last_query_status(void)
+{
+  return s_last_query_status;
+}
+
+const char *tvoc_query_status_str(tvoc_query_status_t status)
+{
+  switch (status)
+  {
+  case TVOC_QUERY_OK:           return "ok";
+  case TVOC_QUERY_NO_RESPONSE:  return "no response";
+  case TVOC_QUERY_BAD_FRAMING:  return "bad framing";
+  case TVOC_QUERY_BAD_CHECKSUM: return "bad checksum";
+  default:                      return "unknown";
+  }
 }
 
 void tvoc_recalibrate(void)

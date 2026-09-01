@@ -988,7 +988,7 @@ static void report_analog_input(uint8_t ep, float value)
 /**
  * @brief Report the SCD41 climate group (temperature, humidity, CO2) on EP1.
  */
-void zigbee_report_climate(uint16_t co2, float temperature, float humidity)
+void zigbee_report_climate(uint16_t co2, float temperature, float humidity, bool co2_valid)
 {
   if (!zigbee_initialized)
   {
@@ -996,7 +996,14 @@ void zigbee_report_climate(uint16_t co2, float temperature, float humidity)
     return;
   }
 
-  ESP_LOGI(TAG, "Reporting climate: CO2=%d, Temp=%.2f, Humidity=%.2f", co2, temperature, humidity);
+  if (co2_valid)
+  {
+    ESP_LOGI(TAG, "Reporting climate: CO2=%d, Temp=%.2f, Humidity=%.2f", co2, temperature, humidity);
+  }
+  else
+  {
+    ESP_LOGI(TAG, "Reporting climate: CO2=<unknown>, Temp=%.2f, Humidity=%.2f", temperature, humidity);
+  }
 
   /* Stack calls from outside the Zigbee mainloop task must hold the stack lock */
   esp_zigbee_lock_acquire(portMAX_DELAY);
@@ -1013,11 +1020,16 @@ void zigbee_report_climate(uint16_t co2, float temperature, float humidity)
                          EZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_MEASURED_VALUE_ID, EZB_ZCL_STD_MANUF_CODE, &humidity_value, false);
   report_attr(BASIC_ENDPOINT, EZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT, EZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_MEASURED_VALUE_ID);
 
-  /* CO2 as a fraction of one (ppm / 1e6) */
-  float co2_fraction = (float)co2 / 1000000.0f;
-  ezb_zcl_set_attr_value(BASIC_ENDPOINT, EZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT, EZB_ZCL_CLUSTER_SERVER,
-                         EZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID, EZB_ZCL_STD_MANUF_CODE, &co2_fraction, false);
-  report_attr(BASIC_ENDPOINT, EZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT, EZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID);
+  /* CO2 as a fraction of one (ppm / 1e6). Skipped entirely when the caller has no
+   * trustworthy value: the attribute then keeps whatever it holds -- NaN on a boot
+   * that never saw a good reading, which HA renders as "unknown". */
+  if (co2_valid)
+  {
+    float co2_fraction = (float)co2 / 1000000.0f;
+    ezb_zcl_set_attr_value(BASIC_ENDPOINT, EZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT, EZB_ZCL_CLUSTER_SERVER,
+                           EZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID, EZB_ZCL_STD_MANUF_CODE, &co2_fraction, false);
+    report_attr(BASIC_ENDPOINT, EZB_ZCL_CLUSTER_ID_CARBON_DIOXIDE_MEASUREMENT, EZB_ZCL_ATTR_CARBON_DIOXIDE_MEASUREMENT_MEASURED_VALUE_ID);
+  }
 
   esp_zigbee_lock_release();
 }
@@ -1025,7 +1037,7 @@ void zigbee_report_climate(uint16_t co2, float temperature, float humidity)
 /**
  * @brief Report the host-computed TVOC value (ppb) on EP3.
  */
-void zigbee_report_tvoc(uint16_t tvoc)
+void zigbee_report_tvoc(uint16_t tvoc, bool tvoc_valid)
 {
   if (!zigbee_initialized)
   {
@@ -1033,11 +1045,21 @@ void zigbee_report_tvoc(uint16_t tvoc)
     return;
   }
 
-  ESP_LOGI(TAG, "Reporting TVOC: %d ppb", tvoc);
+  if (tvoc_valid)
+  {
+    ESP_LOGI(TAG, "Reporting TVOC: %d ppb", tvoc);
+  }
+  else
+  {
+    ESP_LOGI(TAG, "Reporting TVOC: <unknown> (sensor not responding)");
+  }
 
   /* Stack calls from outside the Zigbee mainloop task must hold the stack lock */
   esp_zigbee_lock_acquire(portMAX_DELAY);
-  report_analog_input(TVOC_ENDPOINT, (float)tvoc);
+  /* NaN is this cluster's "undefined" -- the value EP3 is created with, and what
+   * makes HA show "unknown" before the first reading. Writing it back is what turns
+   * the entity from a frozen last-known value into "unknown" when the sensor dies. */
+  report_analog_input(TVOC_ENDPOINT, tvoc_valid ? (float)tvoc : NAN);
   esp_zigbee_lock_release();
 }
 

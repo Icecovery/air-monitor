@@ -9,6 +9,22 @@ ESP-IDF firmware for an ESP32-H2 based **Zigbee air quality monitor**:
 - **Zigbee end device** (esp-zigbee-lib 2.x on ESP-IDF v6): reports all readings to Home Assistant / ZHA
 - **WS2812 RGB LED**: status / error indication
 
+## Calibration
+
+To calibrate the temperature offset, use the following formula:
+
+$$
+\Delta_{\text{new}} = \Delta_{\text{old}} + t_{\text{reported}} - t_{\text{reference}}
+$$
+
+where:
+
+- $\Delta_{\text{new}}$ is the new offset to write to the SCD41
+- $\Delta_{\text{old}}$ is the previous offset
+- $t_{\text{reported}}$ is the temperature reported by the SCD41
+- $t_{\text{reference}}$ is the temperature measured by a reference thermometer
+
+
 ## Hardware
 
 Waveshare **ESP32-H2-Zero** (ESP32-H2FH4, 4 MB flash, single-core 96 MHz, 802.15.4 + BLE).

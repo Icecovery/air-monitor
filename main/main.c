@@ -33,6 +33,7 @@ static const char *TAG = "main";
 // partition) for state that needs to persist across reboots.
 #define APP_NVS_NAMESPACE        "airmon"
 #define APP_NVS_KEY_SCD41_CFG_SET "scd41_cfg_set"
+#define APP_NVS_KEY_CO2_STUCK    "co2_stuck"
 
 // SCD41 CO2-engine watchdog: occasionally (after days of uptime) the CO2 engine
 // wedges and reports a stuck 0 ppm while temperature/humidity (a separate sensing
@@ -42,6 +43,31 @@ static const char *TAG = "main";
 // sample cadence) triggers a soft re-init (mirrors the boot sequence); if it's
 // still stuck after another ~1 min, escalate to a full device reboot.
 #define SCD41_CO2_STUCK_ZERO_STREAK 12
+
+// ...but a permanently dead CO2 engine would otherwise reboot us forever (~2.5 min
+// per cycle), which fixes nothing and costs a full tri-color e-paper refresh every
+// time (the panel never survives to its 10 min update, so it just redraws the boot
+// screen). So the reboot is budgeted: after SCD41_CO2_STUCK_MAX_REBOOTS consecutive
+// stuck-zero self-reboots we give up and stay up, reporting CO2 as "unknown" while
+// temperature/humidity (a separate element) keep flowing. The count is persisted
+// (APP_NVS_KEY_CO2_STUCK) because our own reboot would otherwise wipe it, and is
+// re-armed by either of the two things that mean the situation actually changed:
+// any non-zero CO2 reading, or a reset that was not our own esp_restart() -- i.e.
+// somebody power-cycled the device or pressed reset.
+#define SCD41_CO2_STUCK_MAX_REBOOTS 2
+
+// TVOC sensor liveness. A dead or unplugged TVOC module simply never answers, and
+// every failure path in the driver logs at DEBUG (compiled out at this project's log
+// level), so without this a failed sensor is invisible: HA and the display would keep
+// showing the last reading forever. After TVOC_FAIL_INVALIDATE_POLLS consecutive
+// unanswered polls (~30 s at the 1 Hz cadence) tvoc_task clears g_tvoc_valid, which
+// turns the HA entity to "unknown" and the display field to "TBD". No reboot and no
+// re-init: unlike the SCD41's CO2 engine there is nothing a reset would fix, and the
+// rest of the device is unaffected. A single good poll restores it.
+#define TVOC_FAIL_INVALIDATE_POLLS 30
+// After the first warning, log only every Nth failure so a permanently absent sensor
+// leaves a visible trail (~1/min) without flooding the console.
+#define TVOC_FAIL_LOG_INTERVAL 60
 
 // Mutexes for shared data
 static SemaphoreHandle_t tvoc_data_mutex = NULL;
@@ -63,9 +89,24 @@ static uint16_t g_co2_reading = 0;
 
 // Set true once each sensor has produced at least one valid reading. Until then
 // we don't push its group to Zigbee, so HA shows "unknown" rather than a fake 0.
-// Monotonic latches (false->true once), single writer each; plain volatile is safe.
-static volatile bool g_tvoc_valid = false; // TVOC sensor
-static volatile bool g_co2_valid = false;  // SCD41 (CO2/temperature/humidity)
+// Single writer each; plain volatile is safe. g_tvoc_valid is the one that can also
+// go back to false, when the TVOC sensor stops answering (see TVOC_FAIL_INVALIDATE_POLLS).
+static volatile bool g_tvoc_valid = false;    // TVOC sensor
+static volatile bool g_climate_valid = false; // SCD41 answered at all (gates the EP1 group)
+
+// The CO2 *number* needs its own latch, because the CO2 engine can wedge at a stuck
+// 0 while temperature/humidity keep working (see the CO2 watchdog above). Set only
+// by a non-zero reading, so a boot that starts with the engine already wedged leaves
+// the CO2 attribute at its NaN default -- HA shows CO2 as "unknown" instead of a
+// fake 0 ppm, without holding temperature/humidity back.
+static volatile bool g_co2_valid = false;
+
+// Diagnosed sensor failures, as opposed to "no reading yet": the CO2 watchdog spent
+// its reboot budget and gave up, or the TVOC module stopped answering. Either one
+// puts a "SENSOR FAILURE" banner on the display (see epaper_display). Written only
+// by the owning sensor task, cleared as soon as that sensor produces data again.
+static volatile bool g_co2_failed = false;
+static volatile bool g_tvoc_failed = false;
 
 // SCD41 calibration (temp offset / altitude), HA-configurable via Zigbee "number"
 // entities (EP10/EP11). g_scd41_* mirror the sensor's true current config (under
@@ -169,7 +210,8 @@ static void tvoc_task(void *pvParameters)
   static uint16_t tvoc_ppb = 0;
   static uint16_t raw_adc = 0;
 
-  bool recal_was_active = false; // for the recalibration "finished" LED pulse
+  bool recal_was_active = false;    // for the recalibration "finished" LED pulse
+  uint32_t tvoc_fail_streak = 0;    // consecutive unanswered polls, see TVOC_FAIL_INVALIDATE_POLLS
 
   while (true)
   {
@@ -200,6 +242,49 @@ static void tvoc_task(void *pvParameters)
       }
     }
 
+    // Liveness, tracked separately from whether we got a *usable* value: tvoc_read
+    // also returns false while the clean-air baseline is seeding, which is not a
+    // fault. tvoc_last_query_status() reports whether the sensor answered at all.
+    if (tvoc_last_query_status() == TVOC_QUERY_OK)
+    {
+      if (tvoc_fail_streak >= TVOC_FAIL_INVALIDATE_POLLS)
+      {
+        ESP_LOGW(TASK_TAG, "TVOC sensor answering again after %u failed polls", (unsigned)tvoc_fail_streak);
+      }
+      tvoc_fail_streak = 0;
+      g_tvoc_failed = false;
+    }
+    else
+    {
+      tvoc_fail_streak++;
+      if (tvoc_fail_streak == 1 || (tvoc_fail_streak % TVOC_FAIL_LOG_INTERVAL) == 0)
+      {
+        ESP_LOGW(TASK_TAG, "TVOC poll failed: %s (%u in a row)",
+                 tvoc_query_status_str(tvoc_last_query_status()), (unsigned)tvoc_fail_streak);
+      }
+      // Stop vouching for the last reading once the sensor has been silent long
+      // enough that it is a fault, not a blip. zigbee_update_task then pushes NaN
+      // (HA: "unknown") and the display switches to "TBD".
+      // Latched on the streak alone, not on g_tvoc_valid, so a module that was
+      // already dead at boot (and so never became valid) still reads as a failure.
+      if (tvoc_fail_streak >= TVOC_FAIL_INVALIDATE_POLLS && !g_tvoc_failed)
+      {
+        ESP_LOGE(TASK_TAG, "TVOC sensor unresponsive for %d polls -- flagging the reading invalid",
+                 TVOC_FAIL_INVALIDATE_POLLS);
+        g_tvoc_failed = true;
+        g_tvoc_valid = false;
+        // Drop the half-filled reporting window with it, so that if the sensor comes
+        // back an hour later its first report isn't an average of fresh samples and
+        // ones taken before it went quiet.
+        if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+        {
+          g_tvoc_accum_sum = 0;
+          g_tvoc_accum_count = 0;
+          xSemaphoreGive(tvoc_data_mutex);
+        }
+      }
+    }
+
     // Flash cyan twice on the falling edge of a button-triggered recalibration,
     // once the fresh clean-air baseline has been seeded (matches the presence
     // sensor's "auto-tune finished" pulse). The start pulse is fired from the
@@ -212,6 +297,30 @@ static void tvoc_task(void *pvParameters)
     recal_was_active = recal_now;
 
     vTaskDelay(pdMS_TO_TICKS(1000)); // 1 Hz, matching the sensor's refresh rate
+  }
+}
+
+// scd41_task's boot sequence uses this in place of HALT_IF_ERR_WITH_LED. An SCD41
+// that doesn't answer at boot (unplugged, dead, bad wiring) fails one of those checks
+// and halts the task right there, so it never reaches the CO2 watchdog further down
+// that would otherwise set g_co2_failed -- leaving the display showing a normal
+// screen with TBD readings instead of the failure banner. So flag it first, then halt
+// exactly as before (only this task stops; the rest of the device carries on).
+#define SCD41_HALT_IF_ERR(TASK_TAG, msg, err)     {                                                 if ((err) != ESP_OK)                            {                                                 g_co2_failed = true;                          }                                               HALT_IF_ERR_WITH_LED(TASK_TAG, msg, err);     }
+
+// Persist the stuck-CO2 self-reboot count (see SCD41_CO2_STUCK_MAX_REBOOTS).
+static void co2_stuck_reboots_save(uint8_t count)
+{
+  nvs_handle_t nvs;
+  if (nvs_open(APP_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK)
+  {
+    nvs_set_u8(nvs, APP_NVS_KEY_CO2_STUCK, count);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+  }
+  else
+  {
+    ESP_LOGW(TAG, "Failed to open NVS to persist the stuck-CO2 reboot count");
   }
 }
 
@@ -247,24 +356,24 @@ static void scd41_task(void *pvParameters)
 
   // Stop periodic measurement if any
   error = scd4x_stop_periodic_measurement(&dev);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error stopping periodic measurement", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error stopping periodic measurement", error);
   ESP_LOGI(TASK_TAG, "Stopped periodic measurement");
 
   // Reinitialize sensor
   error = scd4x_reinit(&dev);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error reinitializing sensor", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error reinitializing sensor", error);
   ESP_LOGI(TASK_TAG, "Reinitialized sensor");
 
   // Read out information about the sensor
   uint16_t serial[3];
   error = scd4x_get_serial_number(&dev, serial, serial + 1, serial + 2);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting serial number", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error getting serial number", error);
   ESP_LOGI(TASK_TAG, "Sensor serial number: 0x%04x%04x%04x", serial[0], serial[1], serial[2]);
 
   // Self test
   bool malfunction = false;
   error = scd4x_perform_self_test(&dev, &malfunction);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error performing self test", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error performing self test", error);
   ESP_LOGI(TASK_TAG, "Self-test status: %s", malfunction ? "MALFUNCTION" : "OK");
 
   bool persisted_settings_dirty = false;
@@ -273,17 +382,33 @@ static void scd41_task(void *pvParameters)
   // later firmware update's SCD41_TEMP_OFFSET/SCD41_ALTITUDE defaults must never
   // silently stomp it -- skip the factory-default comparison/overwrite entirely.
   uint8_t scd41_cfg_set = 0;
+  uint8_t co2_stuck_reboots = 0; // stuck-CO2 self-reboots so far, see the watchdog below
   nvs_handle_t cfg_nvs;
   if (nvs_open(APP_NVS_NAMESPACE, NVS_READONLY, &cfg_nvs) == ESP_OK)
   {
     nvs_get_u8(cfg_nvs, APP_NVS_KEY_SCD41_CFG_SET, &scd41_cfg_set);
+    nvs_get_u8(cfg_nvs, APP_NVS_KEY_CO2_STUCK, &co2_stuck_reboots);
     nvs_close(cfg_nvs);
+  }
+
+  // Only our own stuck-CO2 recovery reboot (esp_restart -> ESP_RST_SW) carries the
+  // budget forward. Any other reset reason means a human power-cycled the device or
+  // pressed reset, which is exactly the "manually rebooted" re-arm. (The Zigbee
+  // connectivity watchdog and the BOOT-button factory reset also self-reboot via SW,
+  // but they only ever preserve a count that a non-zero CO2 reading would have
+  // cleared anyway, so they cost nothing.)
+  if (co2_stuck_reboots != 0 && esp_reset_reason() != ESP_RST_SW)
+  {
+    ESP_LOGI(TASK_TAG, "Manual reset -- re-arming the stuck-CO2 reboot budget (was %u)",
+             (unsigned)co2_stuck_reboots);
+    co2_stuck_reboots = 0;
+    co2_stuck_reboots_save(0);
   }
 
   // set temperature offset
   float temp_offset = 0.0f;
   error = scd4x_get_temperature_offset(&dev, &temp_offset);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting temperature offset", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error getting temperature offset", error);
   ESP_LOGI(TASK_TAG, "Current temperature offset: %.2f °C", temp_offset);
 
   if (!scd41_cfg_set && FLOAT_NEQ(temp_offset, SCD41_TEMP_OFFSET))
@@ -292,7 +417,7 @@ static void scd41_task(void *pvParameters)
 
     // temperature offset
     error = scd4x_set_temperature_offset(&dev, SCD41_TEMP_OFFSET);
-    HALT_IF_ERR_WITH_LED(TASK_TAG, "Error setting temperature offset", error);
+    SCD41_HALT_IF_ERR(TASK_TAG, "Error setting temperature offset", error);
     ESP_LOGI(TASK_TAG, "Set temperature offset to %.2f °C", SCD41_TEMP_OFFSET);
     temp_offset = SCD41_TEMP_OFFSET;
 
@@ -305,7 +430,7 @@ static void scd41_task(void *pvParameters)
   // set altitude compensation
   uint16_t altitude = 0;
   error = scd4x_get_sensor_altitude(&dev, &altitude);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting sensor altitude", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error getting sensor altitude", error);
   ESP_LOGI(TASK_TAG, "Sensor altitude: %d m", altitude);
 
   if (!scd41_cfg_set && altitude != SCD41_ALTITUDE)
@@ -313,7 +438,7 @@ static void scd41_task(void *pvParameters)
     ESP_LOGW(TASK_TAG, "Current sensor altitude %d m is not the expected value of %d m", altitude, SCD41_ALTITUDE);
 
     error = scd4x_set_sensor_altitude(&dev, SCD41_ALTITUDE);
-    HALT_IF_ERR_WITH_LED(TASK_TAG, "Error setting sensor altitude", error);
+    SCD41_HALT_IF_ERR(TASK_TAG, "Error setting sensor altitude", error);
     ESP_LOGI(TASK_TAG, "Set sensor altitude to %d m", SCD41_ALTITUDE);
     altitude = SCD41_ALTITUDE;
 
@@ -327,7 +452,7 @@ static void scd41_task(void *pvParameters)
   if (persisted_settings_dirty)
   {
     error = scd4x_persist_settings(&dev);
-    HALT_IF_ERR_WITH_LED(TASK_TAG, "Error persisting settings", error);
+    SCD41_HALT_IF_ERR(TASK_TAG, "Error persisting settings", error);
     ESP_LOGI(TASK_TAG, "Persisted settings to non-volatile memory");
   }
 
@@ -346,12 +471,12 @@ static void scd41_task(void *pvParameters)
   // check if automatic self-calibration is enabled
   bool asc_enabled = false;
   error = scd4x_get_automatic_self_calibration(&dev, &asc_enabled);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error getting automatic self-calibration status", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error getting automatic self-calibration status", error);
   ESP_LOGI(TASK_TAG, "Automatic self-calibration is %s", asc_enabled ? "ENABLED" : "DISABLED");
 
   // Start periodic measurements (5sec interval)
   error = scd4x_start_periodic_measurement(&dev);
-  HALT_IF_ERR_WITH_LED(TASK_TAG, "Error starting periodic measurement", error);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error starting periodic measurement", error);
   ESP_LOGI(TASK_TAG, "Ready to start measurements");
 
   // Read measurements loop
@@ -480,7 +605,7 @@ static void scd41_task(void *pvParameters)
                esp_err_to_name(error));
       continue;
     }
-    g_co2_valid = true; // we now have real data (even if the values are zero)
+    g_climate_valid = true; // the SCD41 is answering (even if CO2 comes back zero)
 
     // CO2 engine watchdog -- see SCD41_CO2_STUCK_ZERO_STREAK above.
     if (co2 == 0)
@@ -502,19 +627,45 @@ static void scd41_task(void *pvParameters)
           co2_zero_streak = 0; // give the re-init its own ~1 min window before condemning it
           continue;            // no measurement ready yet right after re-init
         }
-        else
+        else if (co2_stuck_reboots < SCD41_CO2_STUCK_MAX_REBOOTS)
         {
-          ESP_LOGE(TASK_TAG, "CO2 still stuck at 0 after SCD41 soft re-init -- rebooting device");
+          co2_stuck_reboots++;
+          ESP_LOGE(TASK_TAG, "CO2 still stuck at 0 after SCD41 soft re-init -- rebooting device (%u/%u)",
+                   (unsigned)co2_stuck_reboots, (unsigned)SCD41_CO2_STUCK_MAX_REBOOTS);
+          co2_stuck_reboots_save(co2_stuck_reboots);
           status_led_solid(STATUS_LED_RED);
           vTaskDelay(pdMS_TO_TICKS(500)); // let the log/LED settle before reset
           esp_restart();
+        }
+        else if (!g_co2_failed)
+        {
+          // Budget spent -- rebooting again would only loop. Stay up and keep serving
+          // temperature/humidity; g_co2_valid never latched this boot, so HA and the
+          // display show CO2 as unknown/TBD rather than a fake 0. The non-zero branch
+          // below (or a manual power-cycle) re-arms all of this.
+          g_co2_failed = true; // budget spent: stay up, stop rebooting
+          ESP_LOGE(TASK_TAG,
+                   "CO2 still stuck at 0 after %u self-reboots -- giving up; CO2 stays "
+                   "unknown until a non-zero reading or a manual reset",
+                   (unsigned)SCD41_CO2_STUCK_MAX_REBOOTS);
         }
       }
     }
     else
     {
+      g_co2_valid = true; // a real, non-zero reading: the CO2 engine is alive
       co2_zero_streak = 0;
       co2_reinit_attempted = false;
+      if (g_co2_failed)
+      {
+        ESP_LOGI(TASK_TAG, "CO2 engine recovered on its own -- re-arming the watchdog");
+        g_co2_failed = false;
+      }
+      if (co2_stuck_reboots != 0)
+      {
+        co2_stuck_reboots = 0;
+        co2_stuck_reboots_save(0);
+      }
     }
 
     if (co2 != g_co2_reading || FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading))
@@ -542,7 +693,7 @@ static void display_update_task(void *pvParameters)
 
   vTaskDelay(pdMS_TO_TICKS(10000)); // Wait for 10s so we won't have big voltage spikes on startup
 
-  epaper_setup();
+  epaper_setup(g_co2_failed || g_tvoc_failed);
 
   while (true)
   {
@@ -585,7 +736,8 @@ static void display_update_task(void *pvParameters)
 
     status_led_solid(STATUS_LED_DIM_BLUE);
     epaper_display(co2, tvoc, temperature, humidity,
-                   g_co2_valid, g_tvoc_valid,
+                   g_climate_valid, g_co2_valid, g_tvoc_valid,
+                   g_co2_failed || g_tvoc_failed,
                    zigbee_time_is_synced());
     status_led_off();
   }
@@ -615,11 +767,13 @@ static void zigbee_update_task(void *pvParameters)
     // sample taken during this window, not just whichever one happened to be
     // latest when the timer fired ---
     bool tvoc_changed = false;
+    bool tvoc_invalidated = false;
     uint32_t tvoc_sum = 0, tvoc_count = 0;
     bool have_tvoc_samples = false;
+    bool tvoc_valid = g_tvoc_valid;
     if (xSemaphoreTake(tvoc_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
-      if (g_tvoc_valid && g_tvoc_accum_count > 0)
+      if (tvoc_valid && g_tvoc_accum_count > 0)
       {
         tvoc_sum = g_tvoc_accum_sum;
         tvoc_count = g_tvoc_accum_count;
@@ -635,7 +789,16 @@ static void zigbee_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take TVOC data mutex for Zigbee update");
     }
 
-    if (have_tvoc_samples)
+    if (!tvoc_valid && tvoc_reported)
+    {
+      // tvoc_task gave up on the sensor (see TVOC_FAIL_INVALIDATE_POLLS). Push
+      // "unknown" once so HA stops showing a frozen value; the display switches to
+      // "TBD" off the same flag. Clearing tvoc_reported also force-sends the first
+      // reading if the sensor ever comes back, even if it matches the old value.
+      tvoc_invalidated = true;
+      tvoc_reported = false;
+    }
+    else if (have_tvoc_samples)
     {
       uint16_t tvoc_avg = (uint16_t)((tvoc_sum + tvoc_count / 2) / tvoc_count); // round to nearest
       if (!tvoc_reported || tvoc_avg != tvoc)
@@ -645,10 +808,14 @@ static void zigbee_update_task(void *pvParameters)
       }
     }
 
-    if (tvoc_changed)
+    if (tvoc_invalidated)
+    {
+      zigbee_report_tvoc(0, false);
+    }
+    else if (tvoc_changed)
     {
       tvoc_reported = true;
-      zigbee_report_tvoc(tvoc);
+      zigbee_report_tvoc(tvoc, true);
     }
 
     // --- Climate group (SCD41: CO2 / temperature / humidity) ---
@@ -656,12 +823,16 @@ static void zigbee_update_task(void *pvParameters)
     // above) -- a bare 0 is the CO2 engine glitching, not a real reading, so it's
     // suppressed here rather than forwarded to HA as a fake spike to 0. Temperature/
     // humidity (a separate sensing element) still report normally in the same cycle.
+    // If the engine was already wedged when this boot started, g_co2_valid never
+    // latched, so the CO2 attribute is left untouched at its NaN default and HA shows
+    // CO2 as "unknown" while temperature/humidity keep updating.
     bool climate_changed = false;
+    bool co2_valid = g_co2_valid;
     if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
     {
       uint16_t new_co2 = g_co2_reading;
       bool co2_changed = (new_co2 != 0) && (!climate_reported || new_co2 != co2);
-      if (g_co2_valid &&
+      if (g_climate_valid &&
           (!climate_reported || co2_changed ||
            FLOAT_NEQ(temperature, g_temperature_reading) || FLOAT_NEQ(humidity, g_humidity_reading)))
       {
@@ -680,7 +851,7 @@ static void zigbee_update_task(void *pvParameters)
     if (climate_changed)
     {
       climate_reported = true;
-      zigbee_report_climate(co2, temperature, humidity);
+      zigbee_report_climate(co2, temperature, humidity, co2_valid);
     }
   }
 }

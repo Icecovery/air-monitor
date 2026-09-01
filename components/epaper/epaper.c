@@ -26,7 +26,8 @@ const char *bad = "(";
  * cannot render letters) instead of a real value, and skip the color-coded
  * alarm logic, since an unknown value can't be judged good/bad. */
 static void draw_data_screen(uint16_t co2, uint16_t tvoc, float temperature, float humidity,
-                              bool co2_valid, bool tvoc_valid, bool time_synced)
+                              bool climate_valid, bool co2_valid, bool tvoc_valid,
+                              bool sensor_failure, bool time_synced)
 {
   Paint_NewImage(imageCache, EPD_2IN15G_WIDTH, EPD_2IN15G_HEIGHT, 90, EPD_2IN15G_WHITE);
   Paint_SetScale(4);
@@ -36,7 +37,7 @@ static void draw_data_screen(uint16_t co2, uint16_t tvoc, float temperature, flo
   // === first row ===
 
   Paint_DrawString_EN(4, 0, "Temperature", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
-  if (co2_valid)
+  if (climate_valid)
   {
     // '~' is the combined degree-C glyph in RecMono36 (relocated off 'C' so 'C' can
     // be a real letter for the month abbreviation -- see rec_mono_36.c header).
@@ -49,7 +50,7 @@ static void draw_data_screen(uint16_t co2, uint16_t tvoc, float temperature, flo
   }
 
   Paint_DrawString_EN(164, 0, "Relative Humidity", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
-  if (co2_valid)
+  if (climate_valid)
   {
     snprintf(strBuffer, sizeof(strBuffer), "%.2f%%", humidity);
     Paint_DrawString_LUT(164, 10, strBuffer, &RecMono36, (humidity >= 35.0f && humidity <= 60.0f) ? EPD_2IN15G_BLACK : EPD_2IN15G_RED, EPD_2IN15G_WHITE);
@@ -94,43 +95,60 @@ static void draw_data_screen(uint16_t co2, uint16_t tvoc, float temperature, flo
   }
 
   // === third row ===
-  // "Updated at" replaces the old blank eCO2/CH2O spot (those sensors can't be
-  // computed reliably -- see docs/re-report.md) with when this screen was last
-  // drawn, sourced from the Zigbee mesh's real-world time (see zigbee.c). The
-  // air-quality face at the row's right edge is driven by the CO2 reading (below).
-  Paint_DrawString_EN(4, 118, "Updated at", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
-  // Uppercase 3-letter months: the RecMono36 LUT font only carries capitals.
-  static const char *const months[] = {
-    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
-  };
-  char time_buf[16];
-  if (time_synced)
+  // Normally "Updated at" plus a big timestamp -- this spot used to be the blank
+  // eCO2/CH2O field (those can't be computed reliably, see docs/re-report.md) -- with
+  // the time sourced from the Zigbee mesh (see zigbee.c) and a CO2-driven air-quality
+  // face at the row's right edge.
+  //
+  // When a sensor has actually been diagnosed as failed the entire row below the
+  // divider is painted yellow and carries a red "SENSOR FAILURE" banner instead: no
+  // "Updated at" label, and no face, because the 14-character banner runs past where
+  // the face sits (the timestamp it replaces is only 12).
+  if (sensor_failure)
   {
-    // The system clock holds local wall-clock time (pulled from the coordinator's
-    // Time cluster LocalTime, already timezone/DST-adjusted -- see zigbee.c), so
-    // format it as-is with gmtime_r (no system TZ set, no manual offset needed).
-    time_t local_now = time(NULL);
-    struct tm tm_local;
-    gmtime_r(&local_now, &tm_local);
-    snprintf(time_buf, sizeof(time_buf), "%s %02d %02d:%02d",
-             months[tm_local.tm_mon], tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min);
+    // Fill from just under the divider (y=115, drawn last) to the bottom edge.
+    Paint_DrawRectangle(0, 116, EPD_2IN15G_HEIGHT, EPD_2IN15G_WIDTH,
+                        EPD_2IN15G_YELLOW, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+    // Same font and origin as the timestamp it stands in for. 14 chars x 19px = 266px
+    // from x=4, so it ends at 270 on a 296px-wide canvas.
+    Paint_DrawString_LUT(15, 122, "SENSOR FAILURE", &RecMono36, EPD_2IN15G_RED, EPD_2IN15G_YELLOW);
   }
   else
   {
-    snprintf(time_buf, sizeof(time_buf), "--- -- --:--");
-  }
-  // Big RecMono36 timestamp, 10px below the label -- same label->value offset as the
-  // temperature/humidity rows above (36px tall; the row's bottom descenders sit at
-  // the canvas edge, which is fine as the glyph's last rows are blank).
-  Paint_DrawString_LUT(4, 128, time_buf, &RecMono36, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+    Paint_DrawString_EN(4, 118, "Updated at", &Font12, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+    // Uppercase 3-letter months: the RecMono36 LUT font only carries capitals.
+    static const char *const months[] = {
+      "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
+    };
+    char time_buf[16];
+    if (time_synced)
+    {
+      // The system clock holds local wall-clock time (pulled from the coordinator's
+      // Time cluster LocalTime, already timezone/DST-adjusted -- see zigbee.c), so
+      // format it as-is with gmtime_r (no system TZ set, no manual offset needed).
+      time_t local_now = time(NULL);
+      struct tm tm_local;
+      gmtime_r(&local_now, &tm_local);
+      snprintf(time_buf, sizeof(time_buf), "%s %02d %02d:%02d",
+               months[tm_local.tm_mon], tm_local.tm_mday, tm_local.tm_hour, tm_local.tm_min);
+    }
+    else
+    {
+      snprintf(time_buf, sizeof(time_buf), "--- -- --:--");
+    }
+    // Big RecMono36 timestamp, 10px below the label -- same label->value offset as the
+    // temperature/humidity rows above (36px tall; the row's bottom descenders sit at
+    // the canvas edge, which is fine as the glyph's last rows are blank).
+    Paint_DrawString_LUT(4, 128, time_buf, &RecMono36, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
 
-  // Air-quality face driven by CO2: <800 good, <1200 moderate, else bad. Only shown
-  // once the SCD41 has a real reading -- otherwise co2==0 would read as "good".
-  if (co2_valid)
-  {
-    const char *aqi_symbol = co2 < 800 ? good : (co2 < 1200 ? moderate : bad);
-    snprintf(strBuffer, sizeof(strBuffer), "%s", aqi_symbol);
-    Paint_DrawString_LUT(254, 128, strBuffer, &RecMono36, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+    // Air-quality face driven by CO2: <800 good, <1200 moderate, else bad. Only shown
+    // once the SCD41 has a real reading -- otherwise co2==0 would read as "good".
+    if (co2_valid)
+    {
+      const char *aqi_symbol = co2 < 800 ? good : (co2 < 1200 ? moderate : bad);
+      snprintf(strBuffer, sizeof(strBuffer), "%s", aqi_symbol);
+      Paint_DrawString_LUT(254, 128, strBuffer, &RecMono36, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+    }
   }
 
   // === Dividers ===
@@ -139,7 +157,7 @@ static void draw_data_screen(uint16_t co2, uint16_t tvoc, float temperature, flo
   Paint_DrawLine(0, 115, EPD_2IN15G_HEIGHT, 115, EPD_2IN15G_BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
 }
 
-void epaper_setup(void)
+void epaper_setup(bool sensor_failure)
 {
   ESP_LOGI(TAG, "Initializing e-paper display...");
   DEV_Module_Init();
@@ -166,7 +184,7 @@ void epaper_setup(void)
 
   // Draw the same layout as a real data screen, with every field pending ("TBD")
   // instead of the old one-off "Air Monitor / Pending Data..." screen.
-  draw_data_screen(0, 0, 0.0f, 0.0f, false, false, false);
+  draw_data_screen(0, 0, 0.0f, 0.0f, false, false, false, sensor_failure, false);
 
   ESP_LOGI(TAG, "EPD_2IN15G_Display");
   EPD_2IN15G_Display(imageCache);
@@ -182,7 +200,8 @@ void epaper_setup(void)
 }
 
 void epaper_display(uint16_t co2, uint16_t tvoc, float temperature, float humidity,
-                     bool co2_valid, bool tvoc_valid, bool time_synced)
+                     bool climate_valid, bool co2_valid, bool tvoc_valid,
+                     bool sensor_failure, bool time_synced)
 {
   ESP_LOGI(TAG, "epaper_display called with parameters - CO2: %d ppm, TVOC: %d ppb, Temp: %.3f C, Humidity: %.3f%%",
            co2, tvoc, temperature, humidity);
@@ -193,7 +212,8 @@ void epaper_display(uint16_t co2, uint16_t tvoc, float temperature, float humidi
   EPD_2IN15G_Init();
   DEV_Delay_ms(2000);
 
-  draw_data_screen(co2, tvoc, temperature, humidity, co2_valid, tvoc_valid, time_synced);
+  draw_data_screen(co2, tvoc, temperature, humidity, climate_valid, co2_valid, tvoc_valid,
+                   sensor_failure, time_synced);
 
   ESP_LOGI(TAG, "EPD_2IN15G_Display");
   EPD_2IN15G_Display(imageCache);

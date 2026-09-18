@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include <time.h>
 #include <sys/time.h>
+#include <string.h>
 
 static const char *TAG = "epaper";
 
@@ -157,6 +158,105 @@ static void draw_data_screen(uint16_t co2, uint16_t tvoc, float temperature, flo
   Paint_DrawLine(0, 115, EPD_2IN15G_HEIGHT, 115, EPD_2IN15G_BLACK, DOT_PIXEL_1X1, LINE_STYLE_SOLID);
 }
 
+/* --- Forced-recalibration screens (see epaper_display_calibration) --- */
+
+/* Dimensions of the hand-drawn minus sign for a negative correction. RecMono40Numbers
+ * has digits only, so the sign has to be a rectangle; these match the font's stroke
+ * weight and sit on the digits' optical centre line. */
+#define CAL_MINUS_WIDTH   16
+#define CAL_MINUS_HEIGHT  5
+#define CAL_MINUS_GAP     4  /* between the bar and the first digit */
+#define CAL_MINUS_Y_INSET 18 /* down from the glyph cell's top edge */
+
+/* Vertical bands of the calibration layout. Two 36px headline lines, a divider, then
+ * a Font16 label over a 40px number -- 144px of the 160px canvas. */
+#define CAL_LINE1_Y   2
+#define CAL_LINE2_Y   40
+#define CAL_DIVIDER_Y 80
+#define CAL_LABEL_Y   84
+#define CAL_VALUE_Y   104
+/* Where the value row splits when both CO2 and the correction are shown -- the same
+ * midpoint the normal screen's CO2/tVOC row uses. */
+#define CAL_COLUMN_SPLIT 148
+
+/* Left edge that centres a run of n_chars glyphs between left and right. Clamped so
+ * an over-wide string starts at the left edge rather than off-canvas. */
+static int cal_centered_x(int n_chars, int char_width, int left, int right)
+{
+  int x = left + (right - left - n_chars * char_width) / 2;
+  return x < left ? left : x;
+}
+
+/* One big centred number in RecMono40Numbers, or "TBD" in RecMono36 when there is no
+ * reading yet (that font cannot render letters -- see the note on draw_data_screen). */
+static void cal_draw_value(int left, int right, const char *digits, bool valid)
+{
+  if (!valid)
+  {
+    Paint_DrawString_LUT(cal_centered_x(3, RecMono36.Width, left, right), CAL_VALUE_Y,
+                         "TBD", &RecMono36, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+    return;
+  }
+  Paint_DrawString_LUT(cal_centered_x(strlen(digits), RecMono40Numbers.Width, left, right),
+                       CAL_VALUE_Y, digits, &RecMono40Numbers, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+}
+
+static void draw_calibration_screen(epaper_cal_phase_t phase, uint16_t co2, bool co2_valid,
+                                    int16_t correction_ppm)
+{
+  Paint_NewImage(imageCache, EPD_2IN15G_WIDTH, EPD_2IN15G_HEIGHT, 90, EPD_2IN15G_WHITE);
+  Paint_SetScale(4);
+  Paint_SelectImage(imageCache);
+  Paint_Clear(EPD_2IN15G_WHITE);
+
+  // === headline: "CALIBRATION" over the phase word, both centred ===
+  const char *phase_word = (phase == EPAPER_CAL_COMPLETED) ? "COMPLETED"
+                         : (phase == EPAPER_CAL_FAILED)    ? "FAILED"
+                                                           : "MODE";
+  UWORD headline_color = (phase == EPAPER_CAL_FAILED) ? EPD_2IN15G_RED : EPD_2IN15G_BLACK;
+
+  Paint_DrawString_LUT(cal_centered_x(strlen("CALIBRATION"), RecMono36.Width, 0, EPD_2IN15G_HEIGHT),
+                       CAL_LINE1_Y, "CALIBRATION", &RecMono36, headline_color, EPD_2IN15G_WHITE);
+  Paint_DrawString_LUT(cal_centered_x(strlen(phase_word), RecMono36.Width, 0, EPD_2IN15G_HEIGHT),
+                       CAL_LINE2_Y, phase_word, &RecMono36, headline_color, EPD_2IN15G_WHITE);
+
+  Paint_DrawLine(0, CAL_DIVIDER_Y, EPD_2IN15G_HEIGHT, CAL_DIVIDER_Y, EPD_2IN15G_BLACK,
+                 DOT_PIXEL_1X1, LINE_STYLE_SOLID);
+
+  // === value row: CO2 alone, or CO2 next to the applied correction ===
+  bool two_columns = (phase == EPAPER_CAL_COMPLETED);
+  int co2_right = two_columns ? CAL_COLUMN_SPLIT : EPD_2IN15G_HEIGHT;
+
+  Paint_DrawString_EN(4, CAL_LABEL_Y, "CO2 PPM", &Font16, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+  snprintf(strBuffer, sizeof(strBuffer), "%d", co2);
+  cal_draw_value(0, co2_right, strBuffer, co2_valid);
+
+  if (two_columns)
+  {
+    Paint_DrawString_EN(164, CAL_LABEL_Y, "CORRECTION", &Font16, EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+
+    // Magnitude in the digits-only font, with the sign drawn by hand in front of it.
+    bool negative = correction_ppm < 0;
+    snprintf(strBuffer, sizeof(strBuffer), "%d", negative ? -(int)correction_ppm : (int)correction_ppm);
+    int digits_width = strlen(strBuffer) * RecMono40Numbers.Width;
+    int total_width = digits_width + (negative ? CAL_MINUS_WIDTH + CAL_MINUS_GAP : 0);
+    int x = CAL_COLUMN_SPLIT + (EPD_2IN15G_HEIGHT - CAL_COLUMN_SPLIT - total_width) / 2;
+    if (x < CAL_COLUMN_SPLIT)
+    {
+      x = CAL_COLUMN_SPLIT;
+    }
+    if (negative)
+    {
+      Paint_DrawRectangle(x, CAL_VALUE_Y + CAL_MINUS_Y_INSET,
+                          x + CAL_MINUS_WIDTH, CAL_VALUE_Y + CAL_MINUS_Y_INSET + CAL_MINUS_HEIGHT,
+                          EPD_2IN15G_BLACK, DOT_PIXEL_1X1, DRAW_FILL_FULL);
+      x += CAL_MINUS_WIDTH + CAL_MINUS_GAP;
+    }
+    Paint_DrawString_LUT(x, CAL_VALUE_Y, strBuffer, &RecMono40Numbers,
+                         EPD_2IN15G_BLACK, EPD_2IN15G_WHITE);
+  }
+}
+
 void epaper_setup(bool sensor_failure)
 {
   ESP_LOGI(TAG, "Initializing e-paper display...");
@@ -214,6 +314,33 @@ void epaper_display(uint16_t co2, uint16_t tvoc, float temperature, float humidi
 
   draw_data_screen(co2, tvoc, temperature, humidity, climate_valid, co2_valid, tvoc_valid,
                    sensor_failure, time_synced);
+
+  ESP_LOGI(TAG, "EPD_2IN15G_Display");
+  EPD_2IN15G_Display(imageCache);
+
+  ESP_LOGI(TAG, "Goto Sleep...");
+  EPD_2IN15G_Sleep();
+
+  DEV_Delay_ms(2000); // important, at least 2s
+
+  // close 5V
+  ESP_LOGI(TAG, "Close 5V");
+  DEV_Module_Exit();
+}
+
+void epaper_display_calibration(epaper_cal_phase_t phase, uint16_t co2, bool co2_valid,
+                                int16_t correction_ppm)
+{
+  ESP_LOGI(TAG, "epaper_display_calibration: phase %d, CO2 %d ppm (valid %d), correction %d ppm",
+           (int)phase, co2, (int)co2_valid, (int)correction_ppm);
+
+  ESP_LOGI(TAG, "Wake up and init EPD_2IN15G");
+  DEV_Module_Init();
+  DEV_Delay_ms(1000);
+  EPD_2IN15G_Init();
+  DEV_Delay_ms(2000);
+
+  draw_calibration_screen(phase, co2, co2_valid, correction_ppm);
 
   ESP_LOGI(TAG, "EPD_2IN15G_Display");
   EPD_2IN15G_Display(imageCache);

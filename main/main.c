@@ -23,11 +23,18 @@ static const char *TAG = "main";
 // Onboard BOOT button (GPIO9 on the ESP32-H2 module -- also a boot strapping pin,
 // which is fine to read as a button once the app is running). Active-low.
 //   - short press  -> force an immediate display refresh (same as HA's button)
+//   - triple press -> SCD41 forced recalibration (see the FRC section below)
 //   - hold >= 5 s  -> factory reset (leave the Zigbee network) + reboot
 #define BOOT_BUTTON_GPIO         GPIO_NUM_9
 #define BUTTON_POLL_MS           50
 #define BUTTON_DEBOUNCE_MS       80    // ignore sub-debounce contact blips on release
 #define BUTTON_FACTORY_RESET_MS  5000  // hold this long to factory reset
+// Presses whose releases fall within this window of each other count as one
+// multi-click gesture, which is what separates a triple press from three separate
+// short presses. The cost is that a single press is only acted on once the window
+// expires, so a plain refresh now lags the release by BUTTON_MULTICLICK_MS.
+#define BUTTON_MULTICLICK_MS     600
+#define BUTTON_FRC_CLICKS        3     // presses that trigger a forced recalibration
 
 // App NVS (default partition; the Zigbee stack uses its own separate "zb_storage"
 // partition) for state that needs to persist across reboots.
@@ -125,6 +132,27 @@ static float g_scd41_temp_offset = SCD41_TEMP_OFFSET;
 static uint16_t g_scd41_altitude = SCD41_ALTITUDE;
 static volatile bool g_scd41_cfg_valid = false; // set once scd41_task resolves the sensor's real boot config
 
+// SCD41 forced recalibration (FRC), triggered by a BOOT triple press. ASC is disabled
+// at boot (see scd41_task), so this is the only thing that corrects the sensor's CO2
+// baseline -- run it in the same outdoor air SCD41_FRC_TARGET_PPM describes.
+//
+// The sensor must stay in periodic measurement mode in that air for >3 minutes before
+// the command or it refuses, so the flow is: soak (panel redrawn once a minute), issue
+// the FRC, show the result for a minute, then hand the panel back. Only scd41_task may
+// touch the sensor and only display_update_task may touch the panel, so scd41_task owns
+// the phase and pokes the display task at each transition.
+typedef enum
+{
+  FRC_IDLE = 0,  // normal operation; the display task draws its usual screen
+  FRC_SAMPLING,  // soaking in reference air, waiting out SCD41_FRC_SAMPLE_SECONDS
+  FRC_COMPLETED, // FRC accepted; g_frc_correction holds the applied offset
+  FRC_FAILED,    // the sensor refused the FRC, or the I2C exchange failed
+} frc_phase_t;
+
+static volatile frc_phase_t g_frc_phase = FRC_IDLE;
+static volatile bool g_frc_requested = false;  // set by button_task, consumed by scd41_task
+static volatile int16_t g_frc_correction = 0;  // ppm, meaningful only in FRC_COMPLETED
+
 // Task handle for display_update_task, so the "Force refresh display" Zigbee
 // button can wake it immediately (see display_refresh_requested).
 static TaskHandle_t display_task_handle = NULL;
@@ -190,6 +218,17 @@ static void tvoc_recalibrate_requested(void)
 {
   status_led_blink(STATUS_LED_CYAN, 1, 200, 200); // sampling started (1x)
   tvoc_recalibrate();
+}
+
+// BOOT triple press: ask scd41_task to run a forced recalibration. Only that task may
+// talk to the sensor, so this just raises a flag it picks up on its next 5 s cycle.
+// Ignored while one is already running, so extra presses can't restart the soak.
+static void frc_requested(void)
+{
+  if (g_frc_phase == FRC_IDLE)
+  {
+    g_frc_requested = true;
+  }
 }
 
 static void tvoc_task(void *pvParameters)
@@ -324,6 +363,103 @@ static void co2_stuck_reboots_save(uint8_t count)
   }
 }
 
+// Perform the forced recalibration itself, at the end of the soak. The command is
+// idle-mode only, so periodic measurement has to stop and restart around it.
+//
+// The resulting field-calibration history is written to the sensor's own dedicated
+// EEPROM automatically (datasheet section 3.8), so there is deliberately no
+// scd4x_persist_settings call here -- that one covers the temperature offset and
+// altitude, and its write-endurance budget is not worth spending on a no-op.
+//
+// Sets g_frc_phase to FRC_COMPLETED (with g_frc_correction) or FRC_FAILED, then waits
+// for one fresh post-FRC reading so the result screen shows the *corrected* CO2
+// rather than the pre-FRC value the display globals still hold.
+static void scd41_run_frc(i2c_dev_t *dev, const char *TASK_TAG)
+{
+  uint16_t raw = SCD41_FRC_FAILED_WORD;
+  esp_err_t error = scd4x_stop_periodic_measurement(dev);
+  if (error != ESP_OK)
+  {
+    ESP_LOGE(TASK_TAG, "Error stopping periodic measurement for FRC: %i (%s)",
+             error, esp_err_to_name(error));
+  }
+  else
+  {
+    vTaskDelay(pdMS_TO_TICKS(500)); // datasheet: wait 500 ms after stopping
+
+    error = scd4x_perform_forced_recalibration(dev, SCD41_FRC_TARGET_PPM, &raw);
+    if (error != ESP_OK)
+    {
+      ESP_LOGE(TASK_TAG, "Forced recalibration command failed: %i (%s)",
+               error, esp_err_to_name(error));
+    }
+
+    // Restart measurement whatever the FRC did -- an unrecalibrated sensor still
+    // beats a silent one, and the result screen wants a fresh reading below.
+    esp_err_t restart = scd4x_start_periodic_measurement(dev);
+    if (restart != ESP_OK)
+    {
+      ESP_LOGE(TASK_TAG, "Error restarting periodic measurement after FRC: %i (%s)",
+               restart, esp_err_to_name(restart));
+    }
+  }
+
+  if (error == ESP_OK && raw != SCD41_FRC_FAILED_WORD)
+  {
+    // The sensor returns the correction offset by 0x8000, so 0x8000 means it decided
+    // no correction was needed. SCD41_FRC_FAILED_WORD means it refused outright --
+    // usually too little time in periodic measurement mode, or unstable readings.
+    g_frc_correction = (int16_t)((int32_t)raw - 0x8000);
+    g_frc_phase = FRC_COMPLETED;
+    ESP_LOGW(TASK_TAG, "Forced recalibration accepted: correction %d ppm (target %d ppm)",
+             (int)g_frc_correction, SCD41_FRC_TARGET_PPM);
+    status_led_blink(STATUS_LED_CYAN, 2, 150, 150); // matches the TVOC recal "finished" pulse
+  }
+  else
+  {
+    g_frc_correction = 0;
+    g_frc_phase = FRC_FAILED;
+    ESP_LOGE(TASK_TAG, "Forced recalibration failed (raw 0x%04x)", raw);
+    status_led_blink(STATUS_LED_RED, 3, 150, 150);
+  }
+
+  // The first sample after periodic measurement restarts lands ~5 s later; give it
+  // twice that before giving up and letting the result screen show the stale value.
+  bool ready = false;
+  for (int i = 0; i < 100 && !ready; i++)
+  {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    if (scd4x_get_data_ready_status(dev, &ready) != ESP_OK)
+    {
+      break;
+    }
+  }
+  if (!ready)
+  {
+    ESP_LOGW(TASK_TAG, "No fresh reading within 10 s of the FRC -- result screen shows the last one");
+    return;
+  }
+
+  uint16_t co2 = 0;
+  float temperature = 0.0f, humidity = 0.0f;
+  if (scd4x_read_measurement(dev, &co2, &temperature, &humidity) != ESP_OK)
+  {
+    return;
+  }
+  ESP_LOGI(TASK_TAG, "First post-FRC reading: CO2 %d ppm", co2);
+  if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+  {
+    g_co2_reading = co2;
+    g_temperature_reading = temperature;
+    g_humidity_reading = humidity;
+    xSemaphoreGive(co2_data_mutex);
+  }
+  if (co2 != 0)
+  {
+    g_co2_valid = true;
+  }
+}
+
 static void scd41_task(void *pvParameters)
 {
   const char *TASK_TAG = "scd41_task";
@@ -448,6 +584,26 @@ static void scd41_task(void *pvParameters)
     ESP_LOGI(TASK_TAG, "Good sensor altitude");
   }
 
+  // Automatic self-calibration must stay off. ASC assumes the lowest CO2 the sensor
+  // sees over its calibration window is 400 ppm fresh air; indoors that minimum is
+  // never actually fresh air, so ASC anchors an inflated floor to 400 and drags every
+  // reading low. The baseline is corrected by forced recalibration instead (BOOT
+  // triple press, see the FRC section). The flag lives in the sensor's EEPROM and so
+  // survives reboots -- this only writes when it is actually on, which is the factory
+  // default and therefore the state of a brand-new or factory-reset sensor.
+  bool asc_enabled = false;
+  error = scd4x_get_automatic_self_calibration(&dev, &asc_enabled);
+  SCD41_HALT_IF_ERR(TASK_TAG, "Error getting automatic self-calibration status", error);
+  ESP_LOGI(TASK_TAG, "Automatic self-calibration is %s", asc_enabled ? "ENABLED" : "DISABLED");
+
+  if (asc_enabled)
+  {
+    ESP_LOGW(TASK_TAG, "Disabling automatic self-calibration");
+    error = scd4x_set_automatic_self_calibration(&dev, false);
+    SCD41_HALT_IF_ERR(TASK_TAG, "Error disabling automatic self-calibration", error);
+    persisted_settings_dirty = true; // ASC lives in EEPROM; the persist below commits it
+  }
+
   // persist settings if needed
   if (persisted_settings_dirty)
   {
@@ -468,12 +624,6 @@ static void scd41_task(void *pvParameters)
   }
   zigbee_report_scd41_config(temp_offset, altitude);
 
-  // check if automatic self-calibration is enabled
-  bool asc_enabled = false;
-  error = scd4x_get_automatic_self_calibration(&dev, &asc_enabled);
-  SCD41_HALT_IF_ERR(TASK_TAG, "Error getting automatic self-calibration status", error);
-  ESP_LOGI(TASK_TAG, "Automatic self-calibration is %s", asc_enabled ? "ENABLED" : "DISABLED");
-
   // Start periodic measurements (5sec interval)
   error = scd4x_start_periodic_measurement(&dev);
   SCD41_HALT_IF_ERR(TASK_TAG, "Error starting periodic measurement", error);
@@ -485,10 +635,60 @@ static void scd41_task(void *pvParameters)
   static float temperature, humidity;
   static uint32_t co2_zero_streak = 0;
   static bool co2_reinit_attempted = false;
+  TickType_t frc_started = 0;      // when the soak began (FRC_SAMPLING)
+  TickType_t frc_last_draw = 0;    // last panel redraw during the soak
+  TickType_t frc_result_shown = 0; // when the result screen went up
   while (true)
   {
     // we sample once every 5 seconds
     vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // --- Forced recalibration (BOOT triple press) ---
+    // The sensor has to stay in periodic measurement mode in homogeneous air for
+    // >3 minutes before the FRC command, so the soak is just bookkeeping here: the
+    // normal read path below keeps running throughout, and all this does is redraw
+    // the panel once a minute until the time is up.
+    if (g_frc_requested)
+    {
+      g_frc_requested = false;
+      if (g_frc_phase == FRC_IDLE)
+      {
+        ESP_LOGW(TASK_TAG, "Forced recalibration requested -- soaking %d s, target %d ppm",
+                 SCD41_FRC_SAMPLE_SECONDS, SCD41_FRC_TARGET_PPM);
+        g_frc_phase = FRC_SAMPLING;
+        frc_started = xTaskGetTickCount();
+        frc_last_draw = frc_started;
+        status_led_blink(STATUS_LED_CYAN, 1, 200, 200); // sampling started (1x)
+        display_refresh_requested();                    // put the calibration screen up now
+      }
+    }
+
+    if (g_frc_phase == FRC_SAMPLING)
+    {
+      TickType_t now = xTaskGetTickCount();
+      if ((now - frc_started) >= pdMS_TO_TICKS(SCD41_FRC_SAMPLE_SECONDS * 1000))
+      {
+        scd41_run_frc(&dev, TASK_TAG); // sets g_frc_phase / g_frc_correction
+        frc_result_shown = xTaskGetTickCount();
+        display_refresh_requested();
+        continue; // periodic measurement was just restarted; nothing ready to read yet
+      }
+      if ((now - frc_last_draw) >= pdMS_TO_TICKS(SCD41_FRC_REFRESH_SECONDS * 1000))
+      {
+        frc_last_draw = now;
+        display_refresh_requested();
+      }
+    }
+    else if (g_frc_phase != FRC_IDLE)
+    {
+      // Result screen is up. Hand the panel back once it has had its minute.
+      if ((xTaskGetTickCount() - frc_result_shown) >= pdMS_TO_TICKS(SCD41_FRC_RESULT_SECONDS * 1000))
+      {
+        ESP_LOGI(TASK_TAG, "Forced recalibration result shown -- back to the normal display");
+        g_frc_phase = FRC_IDLE;
+        display_refresh_requested();
+      }
+    }
 
     // Apply a pending HA-requested calibration change, if any. Rare path: only
     // stop/resume periodic measurement when there's actually something to apply,
@@ -702,6 +902,30 @@ static void display_update_task(void *pvParameters)
     // way, re-entering this wait afterward naturally rebases the 10-minute timer.
     ulTaskNotifyTake(pdTRUE, DISPLAY_UPDATE_INTERVAL_TICKS);
 
+    // A forced recalibration owns the panel for its duration: no time sync, no normal
+    // layout. scd41_task drives the phase and wakes us once a minute during the soak,
+    // once for the result, and once more when it is done to put the normal screen back
+    // (so the calibration screen never lingers waiting on the 10-minute timer).
+    frc_phase_t frc = g_frc_phase;
+    if (frc != FRC_IDLE)
+    {
+      uint16_t frc_co2 = 0;
+      if (xSemaphoreTake(co2_data_mutex, MUTEX_TIMEOUT_TICKS) == pdTRUE)
+      {
+        frc_co2 = g_co2_reading;
+        xSemaphoreGive(co2_data_mutex);
+      }
+      else
+      {
+        ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for the calibration screen");
+      }
+      epaper_display_calibration(frc == FRC_COMPLETED ? EPAPER_CAL_COMPLETED
+                                 : frc == FRC_FAILED  ? EPAPER_CAL_FAILED
+                                                      : EPAPER_CAL_SAMPLING,
+                                 frc_co2, g_co2_valid, g_frc_correction);
+      continue;
+    }
+
     // Pull a fresh local time from the coordinator for this refresh (rather than
     // keeping our own clock running between updates). Bounded wait for the response;
     // on a miss the system clock keeps whatever the last successful pull set, so a
@@ -734,12 +958,10 @@ static void display_update_task(void *pvParameters)
       ESP_LOGW(TASK_TAG, "Failed to take CO2 data mutex for display update");
     }
 
-    status_led_solid(STATUS_LED_DIM_BLUE);
     epaper_display(co2, tvoc, temperature, humidity,
                    g_climate_valid, g_co2_valid, g_tvoc_valid,
                    g_co2_failed || g_tvoc_failed,
                    zigbee_time_is_synced());
-    status_led_off();
   }
 }
 
@@ -856,9 +1078,10 @@ static void zigbee_update_task(void *pvParameters)
   }
 }
 
-// Polls the onboard BOOT button: a short press forces a display refresh; a >=5 s
-// hold factory-resets the Zigbee network and reboots (flashing magenta 5x, matching
-// the presence sensor's factory-reset feedback).
+// Polls the onboard BOOT button: a short press forces a display refresh; a triple
+// press starts an SCD41 forced recalibration; a >=5 s hold factory-resets the Zigbee
+// network and reboots (flashing magenta 5x, matching the presence sensor's
+// factory-reset feedback).
 static void button_task(void *pvParameters)
 {
   const char *TASK_TAG = "button_task";
@@ -874,15 +1097,19 @@ static void button_task(void *pvParameters)
 
   int held_ms = 0;
   bool reset_fired = false; // one factory reset per press, even if held past the threshold
+  int clicks = 0;           // short presses so far in the current multi-click gesture
+  int idle_ms = 0;          // since the last release, against BUTTON_MULTICLICK_MS
 
   while (true)
   {
     if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) // active-low: pressed
     {
       held_ms += BUTTON_POLL_MS;
+      idle_ms = 0;
       if (held_ms >= BUTTON_FACTORY_RESET_MS && !reset_fired)
       {
         reset_fired = true;
+        clicks = 0; // a hold is not part of any click gesture
         ESP_LOGW(TASK_TAG, "BOOT held %d ms -> factory reset + reboot", held_ms);
         status_led_blink(STATUS_LED_MAGENTA, 5, 80, 80); // factory reset (matches presence sensor)
         zigbee_factory_reset();
@@ -892,14 +1119,38 @@ static void button_task(void *pvParameters)
     }
     else // released
     {
-      // Short press (released before the factory-reset threshold): force a refresh.
+      // A real press just ended (as opposed to the button simply sitting idle):
+      // count it towards the gesture rather than acting on it straight away.
       if (held_ms >= BUTTON_DEBOUNCE_MS && !reset_fired)
       {
-        ESP_LOGI(TASK_TAG, "BOOT short press -> force display refresh");
-        display_refresh_requested();
+        clicks++;
+        idle_ms = 0;
       }
       held_ms = 0;
       reset_fired = false;
+
+      if (clicks > 0)
+      {
+        idle_ms += BUTTON_POLL_MS;
+        if (clicks >= BUTTON_FRC_CLICKS)
+        {
+          // Fire as soon as the third release lands rather than waiting out the
+          // window -- three presses can't be the start of anything else.
+          ESP_LOGW(TASK_TAG, "BOOT triple press -> SCD41 forced recalibration");
+          frc_requested();
+          clicks = 0;
+          idle_ms = 0;
+        }
+        else if (idle_ms >= BUTTON_MULTICLICK_MS)
+        {
+          // One or two presses that went no further. Both mean "refresh" -- treating
+          // a sloppy double press as a refresh beats having it do nothing at all.
+          ESP_LOGI(TASK_TAG, "BOOT short press -> force display refresh");
+          display_refresh_requested();
+          clicks = 0;
+          idle_ms = 0;
+        }
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
   }

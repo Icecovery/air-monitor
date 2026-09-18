@@ -27,4 +27,26 @@ void epaper_display(uint16_t co2, uint16_t tvoc, float temperature, float humidi
                      bool climate_valid, bool co2_valid, bool tvoc_valid,
                      bool sensor_failure, bool time_synced);
 
+/* Screens shown while a forced recalibration (FRC) of the SCD41 is running, driven
+ * by a BOOT triple press (see main.c). The panel is owned by the calibration flow
+ * for its duration -- no readings row, no timestamp.
+ *
+ * Layout is two centered RecMono36 lines ("CALIBRATION" over MODE/COMPLETED/FAILED),
+ * a divider, then the big RecMono40Numbers values below. EPAPER_CAL_COMPLETED splits
+ * the value row into two columns (CO2 PPM | CORRECTION); the other two phases give
+ * the CO2 number the full width. "CALIBRATION MODE" does not fit on one RecMono36
+ * line (16 chars x 19px = 304px on a 296px canvas), hence the two-line headline.
+ *
+ * correction_ppm is only read in EPAPER_CAL_COMPLETED. It is signed, and
+ * RecMono40Numbers carries digits only, so a negative value gets a hand-drawn minus
+ * bar sized to the font's stroke. */
+typedef enum {
+  EPAPER_CAL_SAMPLING,  /* soaking in reference air, waiting out the 3 minutes */
+  EPAPER_CAL_COMPLETED, /* FRC accepted; correction_ppm is the applied offset */
+  EPAPER_CAL_FAILED,    /* the sensor refused the FRC, or the I2C exchange failed */
+} epaper_cal_phase_t;
+
+void epaper_display_calibration(epaper_cal_phase_t phase, uint16_t co2, bool co2_valid,
+                                int16_t correction_ppm);
+
 #endif // EPAPER_H

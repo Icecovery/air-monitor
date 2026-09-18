@@ -20,6 +20,21 @@
 #define SCD41_TEMP_OFFSET 2.8f // degree Celsius
 #define SCD41_ALTITUDE 70 // meter
 
+// --- SCD41 forced recalibration (FRC), triggered by a BOOT triple press ---
+// The reference concentration the sensor is told the air actually is. Sensirion's
+// documented default is 400 ppm, but that is stale: measured outdoor background at
+// this device's location is 432 ppmv, and calibrating against 400 would leave every
+// reading ~30 ppm low. Run the recalibration in that same outdoor air.
+#define SCD41_FRC_TARGET_PPM 432 // ppm
+// The sensor must sit in periodic measurement mode in homogeneous, constant-CO2 air
+// for more than 3 minutes before the FRC command, or it refuses (0xFFFF).
+#define SCD41_FRC_SAMPLE_SECONDS 180
+#define SCD41_FRC_REFRESH_SECONDS 60 // panel redraw cadence during that soak
+#define SCD41_FRC_RESULT_SECONDS 60  // how long the result screen stays up
+// What perform_forced_recalibration returns when it refuses. Anything else is the
+// correction offset by 0x8000 (so 0x8000 means "no correction needed").
+#define SCD41_FRC_FAILED_WORD 0xFFFF
+
 #define I2C_PORT I2C_NUM_0
 #define SDA_GPIO GPIO_NUM_0
 #define SCL_GPIO GPIO_NUM_1

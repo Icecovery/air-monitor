@@ -3,3 +3,7 @@ sdkconfig
 sdkconfig.old
 managed_components/
 dependencies.lock
+
+# local editor / assistant files (contain machine-specific paths)
+.vscode/
+CLAUDE.md
